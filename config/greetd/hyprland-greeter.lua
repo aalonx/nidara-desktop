@@ -31,6 +31,18 @@ end
 
 -- ── Look & feel ───────────────────────────────────────────────────────────────
 hl.config({
+    -- Hyprland paints an "updated to X" news panel on its first launch after a
+    -- version change. On the desktop that is merely off-brand; HERE it lands on
+    -- top of the login card, so the first boot after any `pacman -Syu` that
+    -- carries Hyprland greets the user with someone else's release notes over
+    -- the password field. The desktop config disables it; this one has to say so
+    -- too — the greeter is a separate compositor instance with its own config.
+    -- (Caught by the clean-install VM sweep for 0.5.0, on a box that upgraded
+    -- Hyprland to 0.56.0 during install.)
+    ecosystem = {
+        no_update_news = true,
+    },
+
     input = {
         kb_layout    = readKbLayout(),
         follow_mouse = 1,
