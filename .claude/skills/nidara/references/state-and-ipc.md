@@ -192,6 +192,95 @@ and `Super+B` / `toggleBarOverlay` still promotes it to the OVERLAY layer above 
 window. When you need the authoritative int instead of the cached enum, read `HyprlandState.
 getClientJson(addr).fullscreen` (`hyprctl clients -j`: `0` none / `1` maximized / `2` fullscreen).
 
+### Hyprland reports "no active window" when OUR OWN layer surface drops a keyboard grab
+
+Read `HyprlandState.focusedClient`, **never `AstalHyprland.get_default().focused_client`** — the raw
+property lies, and it stays lying.
+
+Measured on the Hyprland event socket (2026-07-26, one open/close of the island's overview):
+
+```
+  1.62  MARK   ==> OPEN overview        # taking an EXCLUSIVE grab emits NOTHING
+  4.25  MARK   ==> CLOSE overview
+  4.27  EVENT  activewindow>>,          # releasing it announces "no active window"
+  4.27  EVENT  activewindowv2>>
+  6.79  MARK   hyprctl activewindow = [kitty]     # …while the window is still right there
+```
+
+Releasing an EXCLUSIVE keyboard grab makes Hyprland announce that nothing is focused, and **no event
+ever restores it**. So AstalHyprland's `focused_client` goes null and stays null after every island
+mode with `needsKeyboard` (overview, assistant), every Prism dismissal and every app-grid close. The
+one thing that heals it is an *unrelated* re-emission — Hyprland re-sends `activewindow>>class,title`
+when the focused window's **title** changes — which is why a terminal with a spinner recovers by
+itself within a second and an idle browser stays "unfocused" indefinitely. That intermittency is what
+makes this look like a rendering bug instead of a state bug.
+
+It is never only a cosmetic bug, because *everything* asks who is focused: the bar's title capsule
+falls back to the workspace name, `WindowMenu` finds no window to act on, `DockItem` loses its focus
+ring, and "screenshot the focused window" has no target.
+
+`HyprlandState._refresh` therefore reconciles focus before computing its state signature: it keeps the
+last address Hyprland genuinely reported as focused and re-validates it against the live client list —
+still open, **and still on the focused workspace**. Two consequences worth keeping:
+
+- The workspace check is what makes it correct rather than a patch. Without it, switching to an empty
+  workspace would keep showing the window you left behind on the previous one.
+- Reconciling *before* `_stateSignature()` means a grab release is not a structural change at all, so
+  nothing repaints and the capsule never even blinks.
+
+The rule this encodes, and the one to preserve if you touch `getWordmark`: **the workspace name is the
+fallback for an empty workspace, not for "the compositor went quiet".**
+
+### How to find out who holds the keyboard: `dumpState.keyboardFocus`
+
+The compositor will not tell you, and three dead ends prove it (2026-07-26): `hyprctl activewindow`
+reports the focused **window**, which stays put while a layer surface holds the keys; `hyprctl layers`
+does not expose keyboard interactivity at all; and Hyprland's own log carries no focus lines (checked
+on a 55 MB `hyprland.log` — zero matches for "focus"; it is all aquamarine backend spam).
+
+Our side does know, because GDK marks a toplevel active when the compositor sends it
+`wl_keyboard.enter`. `dumpState.keyboardFocus` reports that per shell window:
+
+```bash
+ags request dumpState | jq -c '.keyboardFocus'
+```
+
+```
+"nidara-dock":   {"active": true,  "focusable": false, "focusWidget": null}   # ← keys go nowhere
+"nidara-bar":    {"active": false, ...}
+"nidara-island": {"active": false, ...}
+```
+
+`active: true` on a shell surface means the keyboard is going **there**, not to the user's window.
+`focusWidget` is what would receive a keypress inside it — `GtkText.prism-search-entry` when Prism is
+up, `null` when a surface is holding the keyboard for nothing. **No surface active is ambiguous**: it
+means either the user's window has the keys or nobody does. Disambiguate with the event socket — the
+drop is announced as `activewindow>>,`.
+
+What this instrument found, and what to keep in mind when touching keyboard modes:
+
+| moment | who holds the keyboard |
+|---|---|
+| at rest, just after a shell reload | **`nidara-dock`**, no focus widget |
+| overview open | `nidara-island` |
+| overview closed | **nobody** |
+| app grid open | `nidara-dock` |
+| app grid closed | **`nidara-dock`, still** |
+| Prism open | `nidara-bar` (`GtkText.prism-search-entry`) |
+| Prism closed | **nobody** |
+
+Two distinct faults, and neither is cosmetic — in both the user's window stops receiving keys until
+pointer motion re-triggers focus-follows-mouse. A surface resting in `ON_DEMAND` (the dock) simply
+**keeps** the keyboard; a surface resting in `NONE` (island, bar) leaves it **nowhere**. Note in
+particular that `ON_DEMAND` does *not* hand focus back to the window — that was a wrong guess, and
+this table is what disproved it.
+
+Repairs ruled out by measurement, so nobody re-tries them: `focusWindow` on the still-active window
+(Hyprland no-ops it — the dispatch emits nothing), `focus({ monitor })` (no effect),
+`focus({ last })` (works, but focuses a *different* window and can change workspace), and
+`cursor.move` nudges (warping the pointer generates no libinput motion, so focus-follows-mouse never
+fires — which is why moving the mouse *by hand* cures it and a synthetic move does not).
+
 ### The agent config surface: `describeConfig` / `getConfig` / `setConfig`
 
 Settings are exposed to agents through a typed registry (`core/ConfigRegistry.ts`; entries
