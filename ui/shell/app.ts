@@ -573,6 +573,10 @@ app.start({
         windows.add(barWin);
         windows.add(dockWin);
         windows.add(pointerWin as any);
+        // The Activity Island's own OVERLAY layer surface (see IslandWindow.ts):
+        // a sibling toplevel the bar creates, tracked here so teardown reaches it.
+        const islandWin = (barWin as any).islandWindow
+        if (islandWin) windows.add(islandWin)
 
         // Dock rebuild on settings or pinned list change
         let rebuildTimer: number | null = null
@@ -711,7 +715,10 @@ app.start({
     })
     const lockScreen = () => {
       windows.forEach(w => {
-        if (w.name === "nidara-bar" || w.name === "nidara-dock") {
+        // nidara-island carries the Activity Island's compact CAPSULE, not just
+        // its expanded modes — leave it out of this list and the capsule floats
+        // on top of the lockscreen (it sits on OVERLAY, above the lock surface).
+        if (w.name === "nidara-bar" || w.name === "nidara-dock" || w.name === "nidara-island") {
           try { w.hide() } catch (e) {}
         }
         // The agent pointer paints on OVERLAY (above the lockscreen fallback) —
@@ -723,7 +730,7 @@ app.start({
     }
     const unlockScreen = () => {
       windows.forEach(w => {
-        if (w.name === "nidara-bar" || w.name === "nidara-dock") {
+        if (w.name === "nidara-bar" || w.name === "nidara-dock" || w.name === "nidara-island") {
           try { w.present() } catch (e) {}
         }
       })

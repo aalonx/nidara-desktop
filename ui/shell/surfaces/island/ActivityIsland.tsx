@@ -230,7 +230,10 @@ export function ActivityIsland() {
         })
         // The island is the capsule GROWN, not a separate panel: top-anchored
         // (top edge pinned to the capsule by syncAnchor), centered like the
-        // capsule — the morph only inflates down/sideways.
+        // capsule — the morph only inflates down/sideways. Both the capsule and
+        // this revealer live in the ISLAND's surface (IslandWindow.ts), which is
+        // exactly the monitor rect, so CENTER here and the capsule's own CENTER
+        // land on the same axis with no correction.
         revealer.valign = Gtk.Align.START
         revealer.halign = Gtk.Align.CENTER
         modes.set(mode.id, { mode, revealer })
@@ -289,7 +292,11 @@ export function ActivityIsland() {
          *  glass with the same 2px Cairo inset, so aligning the BOXES aligns
          *  the drawn edges). Falls back to the panel gap when the capsule is
          *  hidden (showWorkspaces off — matches the morph's centered-pop
-         *  fallback). Call per-open, before the reveal. */
+         *  fallback). Call per-open, before the reveal.
+         *
+         *  `relativeTo` is the ISLAND surface's root: the capsule was moved onto
+         *  that surface with the revealers, so this is an ordinary same-window
+         *  measurement again (it used to cross into the bar's window). */
         syncAnchor: (relativeTo: Gtk.Widget, fallbackTop: number) => {
             let top = fallbackTop
             if (capsule.get_mapped()) {
