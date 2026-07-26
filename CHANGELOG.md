@@ -5,6 +5,66 @@ All notable changes to Nidara are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-07-26
+
+### Added
+
+- **The Assistant — experimental, and yours to switch on.** Nidara now has a
+  built-in conversational assistant living in the Activity Island (`Super+A`).
+  It is **off until you configure it** in Settings → AI, and it brings no model
+  of its own: you choose a provider — Anthropic, OpenAI, Google or SpaceXAI, any
+  OpenAI-compatible endpoint, or a local model through Ollama or llama.cpp,
+  which needs no key at all — and it talks to your account. Your API key is
+  stored in the desktop keyring, never in a config file, and nothing leaves your
+  machine until you opt in.
+
+  It drives the desktop through exactly the same command surface an external
+  agent uses, so it can do nothing you have not allowed in Settings → AI: the
+  computer-use permissions stay off by default, and the kill switch
+  (`Super+Shift+Esc`) still revokes everything instantly. Answers stream as they
+  arrive, the capsule shows a working state while a turn runs, and closing the
+  island does not cancel it.
+
+  Marked experimental deliberately: it works, it is useful, and it is younger
+  than the rest of the desktop. Expect rough edges, and expect it to change.
+
+### Fixed
+
+- **The login keyring now unlocks with your session.** Signing in left the
+  keyring closed, so the first application that wanted a secret — a browser, a
+  mail client, the Assistant itself — asked for your login password a second
+  time, every session. A systemd socket was winning a race against PAM's
+  keyring daemon and taking over with no password to unlock anything.
+
+  On existing installs the change lands after a **reboot**, not merely a new
+  login: masking a unit does not stop the copy already running, and a lingering
+  user session keeps it alive across logout. Note too that the desktop now uses
+  the keyring PAM unlocks; if yours was created outside your login password, its
+  secrets are not migrated. Nothing is deleted — the old keyring file stays in
+  `~/.local/share/keyrings/` and Seahorse can open it if you know its password.
+- **Your wallpaper survives a reboot.** Setting a wallpaper worked, but the
+  desktop came back to the shipped default on the next boot.
+- **Typing goes to your window again after closing a shell surface.** Closing
+  the app grid — and, on every shell reload, doing nothing at all — left the
+  dock holding the keyboard, so keystrokes went nowhere until you moved the
+  mouse. It also made every other overlay look broken afterwards.
+- **The bar's title capsule stops lying about what is focused.** It fell back to
+  the workspace name after closing the overview, the Assistant or the search,
+  and it kept naming a window from the workspace you left when you switched
+  workspaces from the app grid. The dock's focus ring, the window menu and
+  "screenshot the focused window" were blind for the same reason.
+- **Switching to an empty workspace from the overview stays there.** The
+  compositor bounced you back to the workspace you came from a few milliseconds
+  later — only ever on empty ones, which is why it read as random.
+- **The login screen no longer greets you with Hyprland's release notes.**
+  Hyprland shows an "updated to X" panel the first time it starts after a
+  version change; on the greeter it landed on top of the login card, so the
+  first boot after any system upgrade that carried Hyprland covered the password
+  field with someone else's news.
+- **The Activity Island's blur reaches the bar underneath it.** The island's
+  expanded panels now sit on their own layer, so the glass blurs what is behind
+  them instead of stacking a seam over the bar mid-morph.
+
 ## [0.4.0] — 2026-07-20
 
 ### Added
