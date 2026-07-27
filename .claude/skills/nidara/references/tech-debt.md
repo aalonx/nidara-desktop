@@ -678,6 +678,102 @@ implemented to spec but only OpenAI-compatible verified live. (f) **Expand-on-fi
 intrusive — watch the user's live verdict; easy to gate tighter or drop. Full plan:
 `~/.claude/plans/spicy-twirling-galaxy.md`.
 
+### 38. Computer-use verb surface — gaps found by audit 2026-07-27
+Traced every verb through all four layers (`nidara-input.c` → `nidara-click` →
+`nidara-mcp` → the built-in Assistant). **Layer 2→3 is complete** — `click_app` /
+`click_at` absorb all four click modes via a `button` param, so the MCP server is
+correctly wired and is NOT where the problem is. Four gaps, cheapest first:
+
+**(a) `move` is BUILT AND UNREACHABLE.** `nidara-input.c` implements five verbs
+(`move` `click` `rightclick` `scroll` `drag`, header line 5); `nidara-click`'s
+`MODES` table (line 164) exposes seven modes and **none of them is `move`**. So
+hover — the thing that reveals tooltips, submenus and hover-only controls, i.e.
+state the a11y tree cannot show you until the pointer is there — is compiled,
+documented and dead. Wrapper + MCP work only, **no C**.
+
+**(b) `drag` is the only asymmetric verb.** Every other verb has both an `-app`
+form (name an AT-SPI node) and an `-at` form (coordinates). Drag has only
+`drag-at`, so dragging a file from one list to another — the archetypal drag —
+forces coordinate guessing instead of naming both ends. The wrapper already
+resolves node→coords for clicks, so this is wrapper + MCP only, **no C**.
+
+**(c) No middle button, no double-click, at any layer.** The injector knows only
+`BTN_LEFT`/`BTN_RIGHT`, and a double-click is not two clicks — it needs the
+timing window modelled. This one IS new C, which means recompiling the binary on
+every machine (`install.sh` builds it), so weigh it accordingly. Double-click
+probably earns that (opening things in file managers is constant); middle-click
+looks marginal.
+
+**(d) Single-output, cross-cutting.** `nidara-input.c`'s header says so
+explicitly: it maps logical coords against ONE output's extent, so every
+positioned verb is wrong on a multi-monitor setup. Widest-reaching of the four.
+Hyprland's own cursor control (`dispatch movecursor`, global coords, natively
+multi-monitor) is the candidate here — it stays compositor-mediated, so it does
+not violate the no-uinput guardian rule; it would complement the virtual-pointer
+path for POSITIONING rather than replace it for buttons.
+
+**Order matters, and it is not what it looks like:** doing the Assistant's
+computer-use parity FIRST would duplicate (a), (b) and (d) into a fourth consumer
+and cement the drag asymmetry in one more place. Fix the surface, then mirror it.
+
+**Not a gap, recorded to stop it being "fixed" again:** `screenshot` is reachable
+by the built-in Assistant today (it is not in `HIDDEN_ACTIONS`) and returns a PNG
+path the Assistant cannot see. That is FINE — "take me a screenshot" is a
+legitimate user request the Assistant fulfils without vision. Do not hide it. The
+only adjustment worth making is wording: the MCP description frames screenshots as
+a way for an agent to *verify its own work*, which is true for a client with vision
+and false for the Assistant.
+
+### 37. Assistant file layer ("tier 1") — debt created 2026-07-27
+The six daemon-local file tools shipped (see `state-and-ipc.md` for the frontiers and the
+enforced invariants). What they left behind:
+
+**(a) The fixed prompt roughly doubled and item 36(b) is now urgent, not theoretical.**
+Measured: `sys` 1687→2688 b, `tools` 3893→7543 b ≈ **+1163 tokens on every step of every
+turn**, against a `run_action` design that was squeezed to ~450 tokens precisely because
+that cost is paid per request. Cache breakpoints recover most of it on paper, but the
+Gemini lane was observed at `cached=0` on the FIRST step of each turn (implicit cache
+expiring in the ~2 min between turns), so on that lane it is largely paid in full. The two
+path lists inside `read_file`/`edit_file` descriptions are the largest single addition and
+are the first dial to turn — they exist to buy the absence of a guess-and-retry round-trip
+(break-even ≈ 25 requests), so measure before cutting them.
+
+**(b) `MAX_STEPS` is now 16 with still no context compaction.** File reads make turns
+genuinely longer, and a `read_file` result can be 24 KB (the `MAX_TOOL_RESULT` cap). The
+existing prior-turn `RESULT_STUB` does not help WITHIN a turn. A long diagnostic
+conversation will hit context limits before it hits the step cap. This is the same debt as
+36(b) seen from the other side; do the turn cap / trim before raising `MAX_STEPS` again.
+
+**(c) No IPC/MCP parity, on purpose — but re-check the reasoning if it ever bites.** File
+tools are daemon-local because MCP clients bring their own. If Nidara ever grows a
+non-MCP external consumer that needs them, that argument stops holding.
+
+**(d) `reloadHyprland` is untested live.** Registration and the dispatch path were checked
+in source only; it re-applies monitor config and the standing rule here is that
+display-affecting commands are not verified by running them. Wants a human eye.
+
+**(e) The `customize` skill is the only skill, and it is unversioned.** Nothing checks that
+`skills/customize/SKILL.md` still matches the code — if the frontier changes and the skill
+does not, the assistant confidently tells users the wrong ownership model. Consider a CI
+check tying the writable-file list in the skill to `WRITE_FILES` in the daemon.
+
+**(g) A turn IN FLIGHT is still lost to a shell restart — the daemon is a CHILD of
+the shell.** Session persistence (36 v1.1) covers reload/crash/logout *between*
+turns, which is every case that happens today. It does not cover the tier-2 case:
+an assistant that edits shell source and reloads is killing its own parent, and
+therefore itself, mid-turn. The fix is topological, not more persistence —
+promote `bin/nidara-agent` to its own **systemd user service** (sibling, not
+child) with a socket instead of stdio pipes; there is precedent in
+`bin/nidara.service`. Deliberately NOT built yet: it trades the lazy-spawn
+property ("an idle desktop shouldn't carry an extra gjs", and one holding an API
+key) for survival nobody needs until tier 2 exists. Build it when tier 2 forces
+it, and make "build → verify → reload" an explicit end-of-turn step at the same
+time so the restart lands on a turn boundary the persistence already handles.
+
+**(f) Legacy `~/.config/hypr/hyprland-user.lua` is writable but NOT git-tracked** — the
+undo history only covers `~/.config/nidara`. Rare (pre-2026-07 installs), logged, and not
+worth a second repo, but know it before promising a user "you can always undo".
+
 **Conversation persistence / history / memory — deferred, user-confirmed 2026-07-20 ("leave it for
 now, note it").** Current v1 behaviour (intended): the conversation lives in memory only — it PERSISTS
 across closing/reopening the island and across compact mutations (the `AgentService` transcript + the
@@ -687,10 +783,21 @@ and by the "New conversation" reset (which also clears the daemon's `history`). 
 can desync: `AgentService.transcript` is the UI view; the daemon's `history[]` is the model context — a
 daemon crash+respawn keeps the UI but loses the model's memory. The agreed roadmap (do NOT build until
 asked):
-- **v1.1 — persist the CURRENT conversation** (small, high value): write the transcript as JSON under
-  `~/.config/nidara/agent/` (house convention) and, on boot, re-feed the structured `history`
-  (user/assistant/tool, not just bubble text) to the daemon so the model *continues* with context, not
-  just displays it. Closes the "lose the thread on reload" gap.
+- ~~**v1.1 — persist the CURRENT conversation**~~ — **DONE 2026-07-27.** Both halves, each owned by
+  whoever holds the data: the daemon writes its neutral `history` to `session.json`, `AgentService`
+  writes the `transcript` to `transcript.json`, both at the same turn boundary (the only point where
+  the history is consistent — every `tool_use` has its result, and a half-written turn restored later
+  would be rejected by the provider). **NOT under `~/.config/nidara/`, which is where this entry
+  originally said to put it**: that directory became a git repo on 2026-07-27 (the write tools' undo
+  history), so persisting there would commit the user's conversations, permanently, into a repo they
+  never asked for. It lives in `$XDG_STATE_HOME/nidara/agent/` (0700) instead — a conversation is not
+  configuration, and the shell log already sets the precedent for state outside `~/.config`.
+  Two things worth knowing: the persisted history is the **stubbed** view (prior turns' tool results
+  are already omitted from every request, so storing their full payloads would be megabytes the model
+  will never see again) with `load_skill` results **exempt**, so a restored conversation still carries
+  its rules; and `reset()` deletes BOTH files from the shell side, because the daemon is spawned
+  lazily and "New conversation" on an idle desktop would otherwise reach a daemon that is not running
+  — clearing the UI while leaving the model's copy on disk to be resurrected by the next message.
 - **v2 — conversation history browser**: "New conversation" archives the current thread; a list to
   revisit past threads (`conversations/*.json`, auto title + timestamp). New UI surface (a submode or
   panel) → needs a design round.

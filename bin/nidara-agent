@@ -38,7 +38,27 @@ import GioUnix from "gi://GioUnix"
 import Secret from "gi://Secret"
 
 const AI_JSON = `${GLib.get_user_config_dir()}/nidara/ai.json`
-const MAX_STEPS = 8            // hard cap on tool-use round-trips per user turn
+// Hard cap on tool-use round-trips per user turn. Was 8, sized for "open the
+// control center" — one action and an answer. Reading files makes turns genuinely
+// longer (find the file → read it → correlate with state → answer), and a turn
+// that dies at the cap costs the user everything it already spent and delivers
+// nothing. 16 covers a real diagnosis without becoming a budget to burn: this is
+// still a desktop assistant, not a coding agent, and the repeated-failure guard
+// below stops the pathological case long before the cap does.
+const MAX_STEPS = 16
+// Paging for read_file. The default is what a model gets when it doesn't think
+// about it, so it has to be small enough that an unthinking read of a big file is
+// survivable; the max is the escape hatch for when it does think.
+const READ_LINES_DEFAULT = 400
+const READ_LINES_MAX = 2000
+const MAX_SEARCH_HITS = 100
+// Ceiling on ANY tool result, applied after the tool runs. Tool results are the
+// whales in the transcript — they land in `history` and ride in every later
+// request of the conversation (measured 2026-07-22: one listApps was 85% of a
+// 31 KB body) — and file reads are the first tool here able to produce hundreds of
+// KB in a single call. Set above every current IPC result, so in practice this
+// only ever bites a file read, and it tells the model how to narrow it.
+const MAX_TOOL_RESULT = 24000
 const HTTP_TIMEOUT = "120"     // curl --max-time (seconds)
 const MAX_HTTP_ATTEMPTS = 3    // 1 try + up to 2 retries on a 5xx / network blip
 const RETRY_BASE_MS = 600      // linear backoff between attempts: 600 ms, then 1200 ms
@@ -75,6 +95,120 @@ function readAiJson() {
     } catch {
         return {}
     }
+}
+
+// ── File frontier (tier 1) ───────────────────────────────────────────────────
+// The assistant's file tools are DAEMON-LOCAL, not IPC actions: external MCP
+// clients bring their own file tools, so there is nothing to mirror onto that
+// surface, and routing file contents through the ags socket would put blocking
+// I/O on the shell's main loop for no gain.
+//
+// Two frontiers, and they are deliberately NOT the same shape:
+//
+//   READ — prefix roots. Nidara's own domain: the user's desktop state, the
+//   shipped defaults (so the assistant can see what it is overriding), and the
+//   shell log (what turns it from a remote control into something that can
+//   diagnose). Not the rest of $HOME: whatever it reads is sent to the model
+//   provider, so the read frontier is a privacy boundary as much as a safety one.
+//
+//   WRITE — an EXACT allowlist of three files, because the write frontier grants
+//   deferred execution and there is no way around that: hyprland-user.lua exists
+//   to hold hl.exec_cmd(…) and hypridle.conf holds on-timeout commands, so
+//   writing them schedules commands for the next session. That is inherent to
+//   "add me a keybind", not a hole. What keeps it honest is that everything
+//   scheduled is legible plain text, gated (allowFileWrite, default off) and
+//   revertible — never an invisible action.
+//
+//   ~/.config/uwsm/env is READABLE and deliberately NOT WRITABLE: it sets the
+//   session environment, so LD_PRELOAD there is straight privilege escalation,
+//   and nothing a user asks an assistant for needs it.
+//
+// Every settings JSON is absent from the write list on purpose — the shell holds
+// them in memory and rewrites them wholesale with no FileMonitor, so an outside
+// edit is silently clobbered by the next settings change. set_config is the only
+// correct door. See skills/customize/SKILL.md.
+const HOME = GLib.get_home_dir()
+const RUNTIME_DIR = GLib.getenv("XDG_RUNTIME_DIR") || "/tmp"
+
+const READ_ROOTS = [
+    `${HOME}/.config/nidara`,
+    `${HOME}/.config/uwsm`,
+    `${HOME}/.config/hypr`,
+    "/usr/share/nidara",
+]
+// Single files outside those roots. The log path mirrors bin/nidara-ui's own
+// `${XDG_RUNTIME_DIR:-/tmp}` fallback; both spellings are listed so the tool
+// works whichever one the session actually used.
+const READ_FILES = [`${RUNTIME_DIR}/nidara-ui.log`, "/tmp/nidara-ui.log"]
+
+// The legacy ~/.config/hypr/hyprland-user.lua is included because pre-2026-07
+// installs still load it (package.path lists ~/.config/nidara first and Lua
+// require() takes the FIRST match, which is what Autostart.tsx's resolveUserConf
+// mirrors) — editing the file Lua actually loads matters more than tidiness.
+const WRITE_FILES = [
+    `${HOME}/.config/nidara/hyprland-user.lua`,
+    `${HOME}/.config/hypr/hyprland-user.lua`,
+    `${HOME}/.config/nidara/hypridle.conf`,
+]
+
+const underRoot = (path, root) => path === root || path.startsWith(root + "/")
+
+// Resolve a model-supplied path and decide whether it is inside the frontier.
+// Returns { path } or { error } — the error text goes straight back to the model
+// as the tool result, so it names what IS allowed rather than just refusing.
+function resolvePath(raw, mode) {
+    let p = String(raw ?? "").trim()
+    if (!p) return { error: "No path given." }
+    if (p === "~") p = HOME
+    else if (p.startsWith("~/")) p = HOME + p.slice(1)
+    if (!p.startsWith("/")) return { error: `Path must be absolute (or start with ~/): "${raw}"` }
+    // Purely lexical: collapses "." and ".." without touching the filesystem, so
+    // "~/.config/nidara/../../.ssh/id_rsa" is resolved BEFORE the prefix check
+    // rather than sneaking past it.
+    const path = GLib.canonicalize_filename(p, null)
+
+    if (mode === "write") {
+        if (!WRITE_FILES.includes(path)) return {
+            error: `Not writable: ${path}. You may only write: ${WRITE_FILES.join(", ")}. `
+                + "Settings live behind set_config — never edit a settings file directly, the shell overwrites it.",
+        }
+        // Symlinks are refused on the write side only. A symlink here would let a
+        // path that passes the allowlist land somewhere else entirely, and the
+        // allowlist is three known files that have no reason to be links. (Reads
+        // do follow them: in a --dev install /usr/share/nidara/config/hypr/
+        // hyprland.lua IS a symlink into the repo, and following it is correct.)
+        try {
+            const info = Gio.File.new_for_path(path).query_info(
+                "standard::is-symlink", Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+            if (info.get_is_symlink()) return { error: `Refusing to write through a symlink: ${path}` }
+        } catch {
+            // Does not exist yet — fine, creating it is allowed.
+        }
+        return { path }
+    }
+
+    if (READ_FILES.includes(path) || READ_ROOTS.some(r => underRoot(path, r))) return { path }
+    return {
+        error: `Not readable: ${path}. You may read ${READ_ROOTS.join(", ")} and the shell log `
+            + `(${READ_FILES[0]}). Everything else is outside your frontier — say so rather than working around it.`,
+    }
+}
+
+// Gate check, re-read per call like every other Nidara helper (nidara-a11y et al),
+// so flipping the switch in Settings → AI takes effect on the next message.
+function fileGate(mode) {
+    const cfg = readAiJson()
+    if (mode === "write") {
+        if (cfg.allowFileWrite !== true) return "Editing files is turned off. The user can enable it in Settings → AI → Files."
+        // Defence in depth: the shell keeps these consistent (setAllowFileWrite
+        // implies read), but ai.json is a plain file anyone can hand-edit into an
+        // inconsistent state, and "write without read" is exactly the combination
+        // that corrupts a file instead of editing it.
+        if (cfg.allowFileRead !== true) return "Editing files needs reading them first, which is turned off (Settings → AI → Files)."
+        return null
+    }
+    if (cfg.allowFileRead !== true) return "Reading files is turned off. The user can enable it in Settings → AI → Files."
+    return null
 }
 
 // Run a command synchronously, capturing stdout+stderr. Used for the fast
@@ -138,6 +272,85 @@ const emitError = (m) => emit({ t: "error", message: String(m) })
 let deltasEmitted = 0
 const emitDelta = (text) => { if (text) { deltasEmitted++; emit({ t: "delta", text }) } }
 
+// ── Skills ───────────────────────────────────────────────────────────────────
+// Markdown playbooks the assistant loads ON DEMAND. Progressive disclosure is the
+// whole point and not a refinement: the in-repo `nidara` skill is ~100k tokens
+// across its references, which is correct for a developer's agent and unusable
+// here, where every token rides on every step of every turn. So the tool
+// description carries only names + one-line descriptions (~30 tokens today) and
+// the body is fetched when the model decides it needs it.
+//
+// Same resolution order as Paths.ts/readShellVersion: a --dev checkout wins over
+// the installed copy, so editing a skill in the repo takes effect without an
+// install.
+function skillsDir() {
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`${HOME}/.config/nidara/.dev`)
+        if (ok) {
+            const dir = `${new TextDecoder().decode(bytes).trim()}/skills`
+            if (GLib.file_test(dir, GLib.FileTest.IS_DIR)) return dir
+        }
+    } catch {}
+    return "/usr/share/nidara/skills"
+}
+
+// Split YAML-ish frontmatter from the body. Deliberately not a YAML parser: the
+// contract is two flat `key: value` lines, and a skill that gets fancier than
+// that should be simplified rather than met with a parser.
+function parseSkill(text) {
+    const m = /^---\n([\s\S]*?)\n---\n?/.exec(text)
+    if (!m) return { meta: {}, body: text }
+    const meta = {}
+    for (const line of m[1].split("\n")) {
+        const kv = /^(\w+):\s*(.*)$/.exec(line)
+        if (kv) meta[kv[1]] = kv[2].trim()
+    }
+    return { meta, body: text.slice(m[0].length).trim() }
+}
+
+let skillsCache = null   // { name: { path, description } }
+function skills() {
+    if (skillsCache) return skillsCache
+    skillsCache = {}
+    const dir = skillsDir()
+    try {
+        const en = Gio.File.new_for_path(dir).enumerate_children(
+            "standard::name,standard::type", Gio.FileQueryInfoFlags.NONE, null)
+        for (;;) {
+            const info = en.next_file(null)
+            if (!info) break
+            if (info.get_file_type() !== Gio.FileType.DIRECTORY) continue
+            const name = info.get_name()
+            const path = `${dir}/${name}/SKILL.md`
+            if (!GLib.file_test(path, GLib.FileTest.EXISTS)) continue
+            let description = ""
+            try {
+                const { meta } = parseSkill(textFile(path))
+                description = meta.description || ""
+            } catch {}
+            skillsCache[name] = { path, description }
+        }
+        en.close(null)
+    } catch (e) {
+        log(`skills: none available (${dir}: ${e?.message ?? e})`)
+    }
+    return skillsCache
+}
+
+function loadSkillTool(name) {
+    const all = skills()
+    const hit = all[String(name ?? "").trim()]
+    if (!hit) return {
+        ok: false,
+        content: `No skill called "${name}". Available: ${Object.keys(all).join(", ") || "(none)"}.`,
+    }
+    try {
+        return { ok: true, content: parseSkill(textFile(hit.path)).body }
+    } catch (e) {
+        return { ok: false, content: `Could not load skill "${name}": ${e?.message ?? e}` }
+    }
+}
+
 // ── Tools offered to the model ───────────────────────────────────────────────
 // ONE passthrough tool (run_action) whose DESCRIPTION carries an index of every
 // desktop action — name + one-clause summary — instead of 32 first-class tool
@@ -191,6 +404,70 @@ const STATIC_TOOL_DEFS = [
         props: {},
         required: [],
     },
+    // ── File tools (tier 1) ──────────────────────────────────────────────────
+    // Deliberately terse: these ride in every request of every turn, and the
+    // frontier does not need explaining here — a refusal names what IS allowed,
+    // which is cheaper than pre-emptive prose and arrives exactly when it helps.
+    // The `customize` skill carries the ownership model; load_skill fetches it.
+    {
+        name: "read_file",
+        description:
+            "Read a text file. Returns numbered lines; long files are paged, so use `offset`/`limit` and read the part you need rather than the whole thing.\n"
+            // The paths, in front of the model at all times — the same reasoning as
+            // run_action's action index. Without them it has to guess a path, take
+            // the refusal (which does name the roots) and retry: a whole wasted
+            // step, ~2000 tokens of round-trip, to save ~50 here.
+            + "What you can read:\n"
+            + `- ${HOME}/.config/nidara/ — the user's desktop state: settings JSONs (read-only, change them with set_config), hyprland-user.lua (their keybinds/rules), hypridle.conf\n`
+            + "- /usr/share/nidara/ — shipped defaults, including the base config/hypr/hyprland.lua that hyprland-user.lua overrides\n"
+            + `- ${READ_FILES[0]} — the shell log: what actually happened, in order. Read this before theorising about a problem.`,
+        props: {
+            path: { type: "string", description: "Absolute path, or ~/… " },
+            offset: { type: "number", description: "First line to return (1-based, default 1)" },
+            limit: { type: "number", description: `Lines to return (default ${READ_LINES_DEFAULT}, max ${READ_LINES_MAX})` },
+        },
+        required: ["path"],
+    },
+    {
+        name: "list_dir",
+        description: "List a directory: names, whether each is a file or directory, and size.",
+        props: { path: { type: "string", description: "Absolute path, or ~/… " } },
+        required: ["path"],
+    },
+    {
+        name: "search_files",
+        description:
+            "Search file contents for a pattern (extended regex) and return matching lines with their file and line number. Use this on the shell log to find an error, or across the config to find where something is set.",
+        props: {
+            pattern: { type: "string", description: "Extended regular expression" },
+            path: { type: "string", description: "File or directory to search" },
+        },
+        required: ["pattern", "path"],
+    },
+    {
+        name: "edit_file",
+        description:
+            "Replace an exact piece of text in a file you may write. `old_text` must match EXACTLY and appear exactly once — include surrounding lines to make it unique. Read the file first.\n"
+            // Same reasoning as read_file's path list: the writable set is three
+            // files, so naming them costs less than a refused call and a retry.
+            + "Writable: ~/.config/nidara/hyprland-user.lua (keybinds, window rules, startup), ~/.config/nidara/hypridle.conf (idle/power timeouts). Settings are NOT files — change them with set_config.",
+        props: {
+            path: { type: "string", description: "File to edit" },
+            old_text: { type: "string", description: "Exact text to replace (must be unique in the file)" },
+            new_text: { type: "string", description: "Replacement text (empty string deletes it)" },
+        },
+        required: ["path", "old_text", "new_text"],
+    },
+    {
+        name: "write_file",
+        description:
+            "Create a writable file, or replace one whole. Prefer edit_file for a change to an existing file; this refuses to overwrite a file you have not read this session.",
+        props: {
+            path: { type: "string", description: "File to write" },
+            content: { type: "string", description: "Full new contents" },
+        },
+        required: ["path", "content"],
+    },
 ]
 
 // IPC action name (camelCase) → wire tool name (snake_case). Function-calling
@@ -241,6 +518,21 @@ function buildToolset() {
         },
         required: ["action"],
     })
+    // Same shape as run_action's index and for the same reason: names + one-line
+    // descriptions in front of the model at all times, bodies behind a call.
+    // Omitted entirely when no skills are installed, rather than offering a tool
+    // that can only fail.
+    const available = skills()
+    const names = Object.keys(available).sort()
+    if (names.length) defs.push({
+        name: "load_skill",
+        description:
+            "Load a playbook with detailed instructions for a kind of task. Read the one that matches BEFORE you start — it carries rules you cannot infer, and getting them wrong is worse than being slow. Available:\n"
+            + names.map(n => `${n} — ${available[n].description || "(no description)"}`).join("\n"),
+        props: { name: { type: "string", description: `One of: ${names.join(", ")}` } },
+        required: ["name"],
+    })
+
     toolsetCache = { defs, actionMap }
     return toolsetCache
 }
@@ -257,6 +549,10 @@ const geminiTools = () => buildToolset().defs.map(d => ({
     parameters: { type: "object", properties: d.props, required: d.required },
 }))
 
+// Shorten a path for the island's tool chip: the user knows where their own
+// config lives, and the full path pushes the interesting part off the capsule.
+const prettyPath = (p) => String(p ?? "").replace(HOME, "~")
+
 function summarizeTool(tu) {
     const i = tu.input || {}
     switch (tu.name) {
@@ -264,9 +560,253 @@ function summarizeTool(tu) {
         case "get_config": return `get_config ${i.key || "(all)"}`
         case "dump_state": return "dump_state"
         case "describe_settings": return "describe_settings"
+        case "read_file": return `read_file ${prettyPath(i.path)}${i.offset ? `:${i.offset}` : ""}`
+        case "list_dir": return `list_dir ${prettyPath(i.path)}`
+        case "search_files": return `search_files "${truncate(String(i.pattern ?? ""), 40)}" in ${prettyPath(i.path)}`
+        case "edit_file": return `edit_file ${prettyPath(i.path)}`
+        case "write_file": return `write_file ${prettyPath(i.path)}`
+        case "load_skill": return `load_skill ${i.name || "?"}`
         case "run_action": return `run_action ${i.action || "?"}${Array.isArray(i.args) && i.args.length ? " " + i.args.join(" ") : ""}`
         default: return tu.name
     }
+}
+
+// ── File tool implementations ────────────────────────────────────────────────
+// GLib/Gio directly: reading a file is a syscall, not a program to launch, so
+// there is no subprocess and no shell in any of these. search_files is the one
+// that shells out, and it does so with a FIXED argv — Gio.Subprocess takes an
+// array and never invokes a shell, so the model supplies data, never a command.
+
+// Applied to EVERY tool result. See MAX_TOOL_RESULT: the cost of a fat result is
+// paid again on every later request of the conversation, not just once.
+const capResult = (res) =>
+    res.content && res.content.length > MAX_TOOL_RESULT
+        ? {
+            ...res,
+            content: res.content.slice(0, MAX_TOOL_RESULT)
+                + `\n… truncated at ${MAX_TOOL_RESULT} characters. Narrow the request (a line range, a tighter pattern) — do not re-run this unchanged.`,
+        }
+        : res
+
+function readFileTool(path, offset, limit) {
+    let raw
+    try {
+        const [ok, data] = GLib.file_get_contents(path)
+        if (!ok) return { ok: false, content: `Could not read ${path}.` }
+        raw = data
+    } catch (e) {
+        return { ok: false, content: `Could not read ${path}: ${e?.message ?? e}` }
+    }
+    let text
+    try {
+        // fatal:true so a binary file is refused with a sentence instead of
+        // becoming a screenful of replacement characters the model then reasons about.
+        text = new TextDecoder("utf-8", { fatal: true }).decode(raw)
+    } catch {
+        return { ok: false, content: `${path} is not a UTF-8 text file.` }
+    }
+
+    const lines = text.split("\n")
+    // A trailing newline leaves a final empty element; drop it so the line count
+    // matches what every other tool would report for this file.
+    if (lines.length && lines[lines.length - 1] === "") lines.pop()
+    if (!lines.length) return { ok: true, content: `(${path} is empty)` }
+
+    const start = Math.max(1, Math.floor(Number(offset) || 1))
+    const count = Math.min(READ_LINES_MAX, Math.max(1, Math.floor(Number(limit) || READ_LINES_DEFAULT)))
+    const slice = lines.slice(start - 1, start - 1 + count)
+    if (!slice.length) return {
+        ok: false,
+        content: `${path} has ${lines.length} lines; offset ${start} is past the end.`,
+    }
+
+    // Records that this path has been seen, which is what write_file's
+    // no-blind-overwrite check consults.
+    readThisSession.add(path)
+    const last = start + slice.length - 1
+    const more = last < lines.length
+        ? `\n… ${lines.length - last} more lines (continue at offset ${last + 1})`
+        : ""
+    // Numbered because the model needs a stable handle to talk to the user about
+    // ("line 12 binds Super+T") and, once write lands, to target an edit.
+    return { ok: true, content: slice.map((l, i) => `${start + i}\t${l}`).join("\n") + more }
+}
+
+function listDirTool(path) {
+    try {
+        const en = Gio.File.new_for_path(path).enumerate_children(
+            "standard::name,standard::type,standard::size",
+            Gio.FileQueryInfoFlags.NONE, null)
+        const rows = []
+        for (;;) {
+            const info = en.next_file(null)
+            if (!info) break
+            rows.push(info.get_file_type() === Gio.FileType.DIRECTORY
+                ? `${info.get_name()}/`
+                : `${info.get_name()}\t${info.get_size()} bytes`)
+        }
+        en.close(null)
+        rows.sort()
+        return { ok: true, content: rows.length ? rows.join("\n") : `(${path} is empty)` }
+    } catch (e) {
+        return { ok: false, content: `Could not list ${path}: ${e?.message ?? e}` }
+    }
+}
+
+function searchFilesTool(pattern, path) {
+    // -r walks a directory (harmless on a single file), -n gives line numbers,
+    // -I skips binaries, -E is the documented dialect, and `--` guarantees a
+    // pattern or path beginning with "-" is read as data rather than a flag.
+    // -m is grep's PER-FILE cap; the global one is applied below.
+    const r = run(["grep", "-rnI", "-E", "-m", String(MAX_SEARCH_HITS), "--", pattern, path])
+    // grep exits 1 for "no matches" — an answer, not a failure. Reporting it as a
+    // failure would invite the model to "fix" a correct call and search again.
+    if (!r.out) return { ok: true, content: r.err ? `No matches. (${truncate(r.err, 200)})` : "No matches." }
+
+    const hits = r.out.split("\n")
+    const shown = hits.slice(0, MAX_SEARCH_HITS)
+    const more = hits.length > shown.length
+        ? `\n… ${hits.length - shown.length} more matches — narrow the pattern or the path.`
+        : ""
+    return { ok: true, content: shown.join("\n") + more }
+}
+
+// ── Write side ───────────────────────────────────────────────────────────────
+// Paths read via read_file this session. write_file (a blind full overwrite) is
+// refused for anything absent from here — the skill asks the model to read before
+// it writes, and an invariant is worth more than a request. edit_file needs no
+// such check: knowing the exact text to replace IS having read it.
+const readThisSession = new Set()
+
+const AUTOSTART_BEGIN = "-- @autostart start"
+const AUTOSTART_END = "-- @autostart end"
+
+// The region of hyprland-user.lua that Settings → Apps → Autostart owns. It
+// rewrites this block from the UI's own list, so anything the assistant puts
+// inside is dropped the next time the user opens that page — silently, days
+// later. Enforced rather than documented: the model writes OUTSIDE the markers or
+// not at all.
+function autostartBlock(text) {
+    const lines = text.split("\n")
+    const s = lines.findIndex(l => l.trim() === AUTOSTART_BEGIN)
+    const e = lines.findIndex(l => l.trim() === AUTOSTART_END)
+    if (s === -1 || e === -1 || e < s) return null
+    return lines.slice(s, e + 1).join("\n")
+}
+
+function autostartGuard(before, after) {
+    const b = autostartBlock(before)
+    if (b === null) return null            // no managed block — nothing to protect
+    const a = autostartBlock(after)
+    if (a === null) return "That edit would remove the `-- @autostart start/end` block, which Settings → Apps → Autostart owns. Leave it exactly as it is and put your change outside the markers."
+    if (a !== b) return "That edit changes the text between `-- @autostart start` and `-- @autostart end`. That block belongs to Settings → Apps → Autostart and is rewritten from the UI's list, so your change there would silently disappear. Put it outside the markers — a second hl.on(\"hyprland.start\", …) block is fine."
+    return null
+}
+
+// Git-backed undo for the config layer. Best-effort by design: a failure here is
+// logged and never fails the write, because the snapshot is a safety net, not the
+// operation the user asked for. Identity is passed per-invocation so this works on
+// a machine with no global git config.
+const CONFIG_DIR = `${HOME}/.config/nidara`
+const GIT = ["git", "-c", "user.name=Nidara Assistant", "-c", "user.email=assistant@nidara.local", "-C", CONFIG_DIR]
+
+// MUST run BEFORE the file is written. Getting this backwards is not a cosmetic
+// ordering nit: `git init` + `add -A` after the write would commit the ALREADY
+// CHANGED file as the baseline, so the very first thing the assistant ever did
+// would be the one thing that could never be undone. Caught in testing 2026-07-27,
+// when the first write produced a history with a single "baseline" commit holding
+// the new content and nothing to revert to.
+function gitEnsureBaseline() {
+    try {
+        if (GLib.file_test(`${CONFIG_DIR}/.git`, GLib.FileTest.EXISTS)) return
+        const init = run([...GIT, "init", "-q"])
+        if (!init.ok) { log(`git: init failed (${truncate(init.err, 120)}) — no undo history`); return }
+        run([...GIT, "add", "-A"])
+        run([...GIT, "commit", "-q", "-m", "Baseline: the config as it was before the Assistant's first change"])
+        log("git: initialised undo history in ~/.config/nidara")
+    } catch (e) {
+        log(`git: baseline failed (${e})`)
+    }
+}
+
+function gitSnapshot(label) {
+    try {
+        if (!GLib.file_test(`${CONFIG_DIR}/.git`, GLib.FileTest.EXISTS)) return
+        run([...GIT, "add", "-A"])
+        const c = run([...GIT, "commit", "-q", "-m", label])
+        // `-q` still reports an empty commit on stdout; it means the write changed
+        // nothing, which is worth neither a log line nor an error.
+        const quiet = `${c.out} ${c.err}`.includes("nothing to commit")
+        if (!c.ok && !quiet) log(`git: commit failed (${truncate(c.err || c.out, 120)})`)
+    } catch (e) {
+        log(`git: snapshot failed (${e}) — the write itself succeeded`)
+    }
+}
+
+// Read the current contents of a write target. Missing is not an error: creating
+// hypridle.conf or a first hyprland-user.lua is legitimate.
+function currentText(path) {
+    try {
+        const [ok, data] = GLib.file_get_contents(path)
+        if (!ok) return ""
+        return new TextDecoder().decode(data)
+    } catch {
+        return ""
+    }
+}
+
+function commitWrite(path, text, label) {
+    // Baseline FIRST — see gitEnsureBaseline. The pre-change state has to be in a
+    // commit before the file changes, or the first edit is unrevertible.
+    const tracked = path.startsWith(CONFIG_DIR + "/")
+    if (tracked) gitEnsureBaseline()
+    try {
+        GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o755)
+        if (!GLib.file_set_contents(path, text)) return { ok: false, content: `Could not write ${path}.` }
+    } catch (e) {
+        return { ok: false, content: `Could not write ${path}: ${e?.message ?? e}` }
+    }
+    // The file changed under the model; the old copy in its context is now stale.
+    readThisSession.delete(path)
+    if (tracked) gitSnapshot(label)
+    const hint = path.endsWith(".lua")
+        ? " Run `run_action reload_hyprland` to apply it, then say what changed."
+        : ""
+    return { ok: true, content: `Wrote ${path} (${text.split("\n").length} lines).${hint}` }
+}
+
+function writeFileTool(path, content) {
+    if (!readThisSession.has(path) && GLib.file_test(path, GLib.FileTest.EXISTS)) return {
+        ok: false,
+        content: `Read ${path} first — write_file replaces the whole file, and this one already exists. Use read_file, then edit_file for a targeted change.`,
+    }
+    const before = currentText(path)
+    const guard = autostartGuard(before, content)
+    if (guard) return { ok: false, content: guard }
+    return commitWrite(path, content, `Assistant: rewrote ${GLib.path_get_basename(path)}`)
+}
+
+function editFileTool(path, oldText, newText) {
+    if (!oldText) return { ok: false, content: "edit_file needs `old_text` — the exact text to replace. To create a file or replace it wholesale, use write_file." }
+    const before = currentText(path)
+    if (!before) return { ok: false, content: `${path} is empty or missing — use write_file to create it.` }
+
+    // Exact and UNIQUE. A first-match replace on an ambiguous anchor edits a line
+    // the model wasn't looking at, and nothing downstream would notice.
+    const first = before.indexOf(oldText)
+    if (first === -1) return {
+        ok: false,
+        content: `That exact text is not in ${path}. Re-read the file — it may have changed, or the whitespace may differ — and match it exactly.`,
+    }
+    if (before.indexOf(oldText, first + 1) !== -1) return {
+        ok: false,
+        content: `That text appears more than once in ${path}. Include enough surrounding lines to make it unique.`,
+    }
+
+    const after = before.slice(0, first) + newText + before.slice(first + oldText.length)
+    const guard = autostartGuard(before, after)
+    if (guard) return { ok: false, content: guard }
+    return commitWrite(path, after, `Assistant: edited ${GLib.path_get_basename(path)}`)
 }
 
 function execTool(tu) {
@@ -304,6 +844,46 @@ function execTool(tu) {
                 out = agsRequest([action, ...args()])
                 break
             }
+            case "read_file": {
+                const gate = fileGate("read")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "read")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(readFileTool(r.path, tu.input?.offset, tu.input?.limit))
+            }
+            case "list_dir": {
+                const gate = fileGate("read")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "read")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(listDirTool(r.path))
+            }
+            case "search_files": {
+                const gate = fileGate("read")
+                if (gate) return { ok: false, content: gate }
+                const pattern = String(tu.input?.pattern ?? "")
+                if (!pattern) return { ok: false, content: "search_files needs a `pattern`." }
+                const r = resolvePath(tu.input?.path, "read")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(searchFilesTool(pattern, r.path))
+            }
+            case "edit_file": {
+                const gate = fileGate("write")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "write")
+                if (r.error) return { ok: false, content: r.error }
+                return capResult(editFileTool(r.path, String(tu.input?.old_text ?? ""), String(tu.input?.new_text ?? "")))
+            }
+            case "load_skill":
+                return capResult(loadSkillTool(tu.input?.name))
+            case "write_file": {
+                const gate = fileGate("write")
+                if (gate) return { ok: false, content: gate }
+                const r = resolvePath(tu.input?.path, "write")
+                if (r.error) return { ok: false, content: r.error }
+                if (tu.input?.content == null) return { ok: false, content: "write_file needs `content`." }
+                return capResult(writeFileTool(r.path, String(tu.input.content)))
+            }
             default:
                 // The model named a tool that isn't offered. Name the real ones so
                 // the correction is actionable instead of a dead end.
@@ -316,7 +896,7 @@ function execTool(tu) {
         // a tool result is appended to `history` and re-sent on every later
         // request of the conversation, so its pretty-printing is paid again and
         // again. Measured 2026-07-21: listWindows −32%, listApps −25%.
-        return { ok: true, content: compactJson(out) || "(ok)" }
+        return capResult({ ok: true, content: compactJson(out) || "(ok)" })
     } catch (e) {
         return { ok: false, content: String(e?.message ?? e) }
     }
@@ -357,7 +937,7 @@ function buildSystemPrompt() {
         "You are Assistant, the built-in helper for the Nidara desktop (a Wayland desktop environment for Arch Linux, compositor Hyprland).",
         "You help the user operate their desktop with natural language by calling tools.",
         // Rich enough to ANSWER from — see the "describing yourself" rule below.
-        "What you can do: open/close shell surfaces (control center, notifications, search, app grid, overview, settings); manage windows and workspaces; launch apps; change settings (appearance, accent, dark mode, dock, notifications, night light, gaming); read desktop state.",
+        "What you can do: open/close shell surfaces (control center, notifications, search, app grid, overview, settings); manage windows and workspaces; launch apps; change settings (appearance, accent, dark mode, dock, notifications, night light, gaming); read desktop state; read the desktop's own configuration files, its shipped defaults and the shell log.",
         "Rules:",
         "- Be concise: you answer in a small chat panel.",
         "- The user is in charge. Do only what they ask; ask first before anything destructive or irreversible.",
@@ -370,6 +950,22 @@ function buildSystemPrompt() {
         "- To do something on the desktop, call run_action with an action name from the list in its description, plus any positional arguments it needs. The list is complete — pick a name from it, never invent one, and never look actions up.",
         "- Settings are the exception: call describe_settings once before your first set_config or targeted get_config, then use the keys it returns. Never guess a setting key.",
         "- If a tool call fails, read the error and correct the call — do not repeat it unchanged. After acting, verify with dump_state/get_config when useful, then briefly confirm what changed.",
+        // The point of the file tools. Without this the model treats them as a
+        // way to answer "what does my config say", which is the least of it: the
+        // difference between a remote control and an assistant is looking at the
+        // log before offering a theory.
+        "- When something is WRONG (a glitch, a surface not opening, an app misbehaving), investigate before you answer: read the shell log and the relevant config file, say what you found, then propose the fix. Do not guess at a cause you have not looked for.",
+        "- You can read Nidara's own config and defaults, not the user's other files. If something is outside what you can reach, say so plainly instead of working around it.",
+        // The routing rule, and the single most costly mistake available here: a
+        // settings JSON edited by hand looks right and is silently overwritten by
+        // the shell minutes later. The tools refuse it, but saying it here stops
+        // the model spending a step finding that out.
+        // The routing rule below is the SUMMARY; the `customize` skill is the full
+        // ownership model (which files the shell owns, why a hand-edited settings
+        // JSON disappears, the @autostart block). Pointing at it here is what makes
+        // progressive disclosure actually happen — a skill nobody loads is a file.
+        "- Before your FIRST file change in a conversation, call load_skill on the skill that matches (for desktop customization that is `customize`). It carries rules you cannot infer from the file itself.",
+        "- Routing a change: a SETTING goes through set_config. A keybind, window rule or startup program goes in ~/.config/nidara/hyprland-user.lua (read it, then edit_file) — then call run_action reload_hyprland to apply it. Never edit a settings JSON directly; the shell owns those and would overwrite you.",
         // The language of the MESSAGE wins, always. The desktop locale is a hint
         // for the ambiguous case, never the rule: people routinely run an English
         // desktop and talk to it in their own language, and switching languages
@@ -408,10 +1004,99 @@ let turnStartIndex = 0
 // stay whole — the model is still working on them. The model is told it can re-run
 // the action, which it does for the rare follow-up that needs the old data again.
 const RESULT_STUB = "(earlier result omitted to save context — re-run the action if you need this again)"
+// A loaded SKILL is the one tool result that must survive stubbing. The rule above
+// holds for DATA — the model read listApps, took what it needed, the payload no
+// longer has to travel. A skill is not data: it is the instructions the model is
+// supposed to keep obeying for the rest of the conversation. Stubbing it meant
+// turn 1 followed the ownership model and turn 2 saw "(earlier result omitted —
+// re-run the action if you need this again)", so the model either re-loaded it
+// (paying the same ~2.3k tokens again, as NEW content that defeats prefix caching
+// precisely when the conversation was about to benefit from it) or carried on with
+// half-remembered rules. Both are worse than just keeping it.
+const isSkillResult = (r) => r.name === "load_skill"
+
+// ── Session persistence ──────────────────────────────────────────────────────
+// The daemon is a CHILD of the shell, so `Super+Shift+R` (or a crash, or a
+// logout) takes it down and the model's context with it: the user came back to a
+// conversation the assistant no longer remembered having. That is annoying in
+// tier 1 and disqualifying for tier 2, where the assistant editing the shell and
+// reloading it means killing its own parent.
+//
+// This is the cheap half of the fix (the roadmap's "v1.1"): survive across
+// restarts by writing state down, rather than by re-parenting the daemon onto its
+// own systemd unit. It covers reload/crash/logout BETWEEN turns, which is every
+// case that actually happens today. A turn in flight is still lost — that needs
+// the sibling-service topology, and it can wait until tier 2 forces it.
+//
+// NOT in ~/.config/nidara, deliberately, breaking the house "all user state is
+// JSON under ~/.config/nidara" convention for one specific reason: that directory
+// is now a GIT REPO (the write tools' undo history), so persisting conversations
+// there would commit the user's chat, permanently, into a repo they never asked
+// for. A conversation is not configuration — it is much closer to the log, which
+// already lives outside ~/.config. XDG_STATE_HOME is exactly this: state that
+// should survive a restart but is not config.
+const STATE_DIR = `${GLib.getenv("XDG_STATE_HOME") || `${HOME}/.local/state`}/nidara/agent`
+const SESSION_FILE = `${STATE_DIR}/session.json`
+const SESSION_VERSION = 1
+// Bound the file. Tool results are already stubbed for prior turns before this is
+// written (see saveSession), so the weight is mostly text, but an unbounded chat
+// would still grow forever on disk — and re-feeding 500 turns to the model on the
+// next boot would be its own bill. Keeps the most recent entries.
+const MAX_PERSISTED = 120
+
+function saveSession() {
+    try {
+        GLib.mkdir_with_parents(STATE_DIR, 0o700)
+        // Persist the STUBBED view, not the raw history: prior turns' tool results
+        // are already omitted from every request, so keeping their full payloads on
+        // disk would store megabytes the model will never see again. Skills survive
+        // (isSkillResult), which is exactly what should be restored — they are the
+        // instructions, not the data.
+        const entries = historyForRequest().slice(-MAX_PERSISTED)
+        const payload = JSON.stringify({ version: SESSION_VERSION, updated: Date.now(), history: entries })
+        // The 0700 directory above is what protects this — the file holds the
+        // conversation in plaintext, and mkdir's mode is the part GJS can actually
+        // guarantee (GLib.chmod is not introspected).
+        GLib.file_set_contents(SESSION_FILE, payload)
+        log(`session saved: ${entries.length} entries, ${payload.length}b`)
+    } catch (e) {
+        // Never fatal: a conversation that cannot be saved is still a conversation.
+        log(`session save failed: ${e?.message ?? e}`)
+    }
+}
+
+function loadSession() {
+    try {
+        if (!GLib.file_test(SESSION_FILE, GLib.FileTest.EXISTS)) return
+        const data = JSON.parse(textFile(SESSION_FILE))
+        if (data?.version !== SESSION_VERSION || !Array.isArray(data.history)) {
+            log(`session ignored: version ${data?.version} (expected ${SESSION_VERSION})`)
+            return
+        }
+        history.push(...data.history)
+        // Everything restored is a PRIOR turn by definition, so the next request
+        // stubs it — which is a no-op, since it was persisted stubbed.
+        turnStartIndex = history.length
+        log(`session restored: ${history.length} entries`)
+    } catch (e) {
+        log(`session restore failed: ${e?.message ?? e} — starting fresh`)
+        history.length = 0
+        turnStartIndex = 0
+    }
+}
+
+function clearSession() {
+    try {
+        if (GLib.file_test(SESSION_FILE, GLib.FileTest.EXISTS)) GLib.unlink(SESSION_FILE)
+    } catch (e) {
+        log(`session clear failed: ${e?.message ?? e}`)
+    }
+}
+
 function historyForRequest() {
     return history.map((m, i) =>
         m.role === "tool" && i < turnStartIndex
-            ? { ...m, results: (m.results || []).map(r => ({ ...r, content: RESULT_STUB })) }
+            ? { ...m, results: (m.results || []).map(r => isSkillResult(r) ? r : { ...r, content: RESULT_STUB }) }
             : m)
 }
 
@@ -1326,6 +2011,10 @@ async function runTurn(userText) {
         // `done` carries the turn's cost and NOTHING else, so it belongs in the
         // finally: it used to sit on the success path only, which meant the
         // expensive failures were exactly the ones the island never counted.
+        // Written at the turn boundary, which is also the only point where the
+        // history is in a consistent state (every tool_use has its result — a
+        // half-written turn restored later would be rejected by the provider).
+        saveSession()
         emit({ t: "done", usage: turnUsage })
         log(`turn end: steps=${Math.min(step, MAX_STEPS)} tok=${turnUsage.input}/${turnUsage.output}${turnUsage.thought ? ` think=${turnUsage.thought}` : ""} cached=${turnUsage.cached} ${Math.round((GLib.get_monotonic_time() - t0) / 1000)}ms`)
         emit({ t: "state", s: "idle" })
@@ -1355,8 +2044,19 @@ function handleMessage(msg) {
             log("reset: history cleared")
             history.length = 0
             turnStartIndex = 0
+            // "New conversation" must mean it on disk too, or the next restart
+            // resurrects the thread the user just discarded.
+            clearSession()
             systemCache = null
             toolsetCache = null
+            // Re-scanned on the next turn, so a skill edited in a --dev checkout
+            // takes effect on "new conversation" instead of needing a respawn.
+            skillsCache = null
+            // The model's memory of what it read is gone with the history, so the
+            // no-blind-overwrite check must forget too — otherwise a fresh
+            // conversation inherits permission to overwrite a file it can no
+            // longer see.
+            readThisSession.clear()
             cancelled = true
             if (currentCurl) { try { currentCurl.force_exit() } catch {} }
             break
@@ -1380,5 +2080,8 @@ function readLoop() {
 }
 
 log("started")
+// Before the first message, so a restored conversation is already the model's
+// context when the user's next turn arrives.
+loadSession()
 readLoop()
 loop.run()
