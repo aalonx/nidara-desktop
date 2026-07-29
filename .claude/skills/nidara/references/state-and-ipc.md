@@ -69,7 +69,9 @@ Current commands (run `listActions` for the live list): `toggleCC|toggleControlC
 `setConfig <key> <value>`, `screenshot [path]`, `queryUI [selector]`, `listApps`, `launchApp <id>`,
 `disableComputerControl`, `notifyComputerAction` (computer-use tools ping it so the bar's AI-control
 indicator pulses "active"), `agentPointer …` (drives the fake-AI-cursor visual — see the
-computer-use section), `listActions`, `dumpState`, plus the **window/workspace management**
+computer-use section), `setIsland <closed|agent|overview|player|battery>` (EXACT island state — use this
+over the ambiguous `toggle*` when you cannot see the current one), `yieldInput <begin|end>` (the helpers make the shell let go of the keyboard
+so their action can land — see "The shell has to step out of the way"), `listActions`, `dumpState`, plus the **window/workspace management**
 cluster (see below): `listWindows`, `listWorkspaces`, `focusWorkspace <id|±1|name>`,
 `focusDirection <l|r|u|d>`, `focusWindow <window>`,
 `closeWindow <window>`, `moveWindowToWorkspace <window> <wsId>`, `toggleFloat`/`toggleFullscreen`/
@@ -160,6 +162,13 @@ still has its global `allowMcp` floor; local `ags request` is always available.
 - **`<window>` is resolved by `resolveWindow(arg)` in `app.ts`** — accepts an exact address
   (`0x…`, what `listWindows` reports — precise) **or** a class/title substring (`firefox`). Every
   window-targeting command shares it, so they all take the same flexible argument.
+- **`focusWindow` yields the shell's keyboard grab first, and VERIFIES.** While one of our layer
+  surfaces grabs, the dispatch is refused outright (next section), so the old handler returned
+  `focused <class>: <title>` for a focus that never happened — and the model believed it and kept
+  going. It now wraps the dispatch in `inputYield.begin()/end()`, waits 80 ms for the answer to
+  arrive by event, compares `HyprlandState.focusedClient` against the requested address, and reports
+  `focus refused by the compositor — still on <class>` when they differ. If you add another
+  focus-moving IPC command, do the same: a success string is a claim, and this one is checkable.
 - **`focusWindow` is ungated** (it used to be gated as the synthetic-keyboard precondition).
   Focusing a window is benign — exactly what a dock click or `launchApp` already does ungated —
   and the gates that matter (`type_text`/`press_key`/`click_*` + AT-SPI `do_app_action`) still
@@ -294,6 +303,61 @@ What works is waiting for the compositor to **announce** the release — that an
 an 80 ms fallback for the case where nothing was focused and no announcement is coming. Any surface
 that switches workspace *while closing* must use it; `focusWorkspace` is for surfaces that stay open
 (the app grid switches workspaces without releasing its grab, so it is unaffected).
+
+### The shell has to STEP OUT OF THE WAY for computer-use: `core/InputYield`
+
+The same refusal has a second victim, and it is the one that made the built-in Assistant look
+useless. Read the compositor's own code (`FocusState.cpp`, `CFocusState::rawWindowFocus`, 0.56):
+
+```cpp
+if (!g_pInputManager->m_exclusiveLSes.empty()) {
+    Log::logger->log(Log::DEBUG, "Refusing a keyboard focus to a window because of an exclusive ls");
+    return;                       // ← a hard return: focus does NOT move, no event is posted
+}
+```
+
+The Assistant island is `needsKeyboard: true`, so it holds an EXCLUSIVE grab the entire time the
+user is typing at it. Therefore, from inside the Assistant:
+
+1. `focus_window <app>` is a **no-op**. Not slow, not racy — refused.
+2. `hyprctl activewindow` then correctly still names the old window, so every helper's focus check
+   (`nidara-click`, `nidara-type`) refuses. **That guard was right.** Do not "fix" it by sourcing
+   focus from the shell (`listWindows.focused`) instead: that only teaches the helper to approve an
+   action that cannot land, and for the keyboard it is actively harmful — the keys genuinely belong
+   to the island, so the text would be typed into the Assistant's own prompt box.
+3. Even with focus sorted, the click would be eaten: Hyprland routes the **pointer** to an
+   exclusive-grabbing surface regardless of its input region, and the island spans the whole
+   monitor (that is why it needs its own catcher — `IslandWindow.setCatcher`).
+
+AT-SPI perception (`query_app`) and named actions (`do_app_action`) never look at focus, so those
+kept working throughout — which is why the failure looked like "the model is bad at clicking".
+
+**The fix is a scoped truce, `core/InputYield`.** `begin()` asks every grabbing surface to drop to
+`NONE` *and* stamp an EMPTY input region, waits for the compositor to announce the release
+(`hyprlandState.afterGrabRelease` — the release is double-buffered, see above), and only then lets
+the caller act. `end()` gives the grab back. Things to keep if you touch it:
+
+- **The helpers drive it, not the agent daemon** (`yieldInput begin|end`, spawned like `visual`).
+  That way an external MCP client acting while the user has Prism or the app grid open is covered
+  by the same mechanism, instead of only the built-in Assistant.
+- **Dropping the grab is not enough on its own.** The grab is what makes Hyprland ignore input
+  regions; the region itself still covers the screen while a panel is open. Every grabbing surface
+  therefore goes click-through for the duration: `Bar.updateInputRegion`, `IslandWindow.updateInputRegion`
+  (capsule included — the surface is monitor-sized) and both `DockAxis.buildInputRegion` bodies
+  return early on `inputYield.active`. In the dock that early return needs **its own region cache
+  key** (`"yield"`), or the restore matches the stale key and silently skips.
+- **`registerHolder` exists so the common case costs nothing.** With no surface grabbing, `begin()`
+  resolves immediately instead of paying the 80 ms release wait on every single action.
+- **A watchdog (15 s) restores everything** if a helper dies between `begin` and `end`. Without it
+  a crash would leave the shell keyboard-less and click-through with no way back.
+- Restore to what the surface should hold **now**, not to what it held before: the app grid drops
+  to `ON_DEMAND` while a context-menu popover is open, and a blind restore to `EXCLUSIVE` would
+  break that menu.
+
+Sequence that works, and why (verified against `rawSurfaceFocus`, which touches only
+`m_focusSurface` — a layer-shell grab never clears `m_focusWindow`): `focusWindow` yields → focus
+moves → grab comes back (window focus untouched) → the helper yields again → the release refocuses
+the last window, which is the target → `hyprctl activewindow` names it → the focus check passes.
 
 ### How to find out who holds the keyboard: `dumpState.keyboardFocus`
 
@@ -525,8 +589,12 @@ exactly like MCP). The **file layer below is the one documented exception** to t
   message's `tool_calls`. So `toolUses` carries an `extra` blob straight from the stream into
   `toOpenaiMsgs()` — never interpreted, never rebuilt, just relayed. Other OpenAI-compatible
   providers don't send the field and don't care. The step log prints `sig=N/M` whenever a turn has
-  tool calls: `sig=0/1` against Gemini means the signature never arrived and the echo can't work
-  (which would make the compat path unusable for tools → the native backend stops being optional).
+  tool calls, **and `tsig=y|n` next to it on the native Gemini lane — read the pair, never `sig=`
+  alone.** The signature legitimately arrives in either place, and on the live Interactions stream
+  it normally rides the **thought step**, not the call: `sig=0/1 tsig=y` is a HEALTHY turn. The
+  real defect is neither (`sig=0/1 tsig=n`), which 400s the next request, and the daemon prints an
+  explicit *"NO reasoning signature anywhere"* line for it rather than leaving a counter to be
+  interpreted — `sig=0/N` alone was misread as a defect indicator for weeks (tech-debt #38 (i)).
 - **Anthropic's equivalent of that rule: echo the THINKING BLOCKS back, verbatim.** Same shape of
   trap, found 2026-07-25 by reading the reference instead of by losing a turn to it. The rule (docs
   → thinking → *preserving thinking blocks*): *"when you return a tool result, the thinking blocks
@@ -569,11 +637,12 @@ exactly like MCP). The **file layer below is the one documented exception** to t
   model. Resolution order: explicit `index` → call `id` → continue the slot being filled (a pure
   continuation chunk carries neither). Keep the slots insertion-ordered so multiple calls execute in
   the order asked for.
-- **Tools offered to the model** (five, all executed via `ags request`, gates enforced by the shell —
-  a refusal comes back as the tool-result STRING; the daemon never re-checks gates; no
-  screenshot/computer-use in v1): `run_action(action, args?)` for every desktop action, plus the
-  settings/state cluster `set_config(key, value)`, `get_config(key?)`, `dump_state()`,
-  `describe_settings()`.
+- **Tools offered to the model.** The `ags request` five — `run_action(action, args?)` for every
+  desktop action, plus the settings/state cluster `set_config(key, value)`, `get_config(key?)`,
+  `dump_state()`, `describe_settings()` — with gates enforced by the SHELL (a refusal comes back as
+  the tool-result STRING; the daemon never re-checks those). Two groups do not go through
+  `ags request` and enforce their own gates in the daemon: the **file layer** and the
+  **computer-use tools** (both below).
 - **Every desktop action goes through ONE `run_action` tool whose DESCRIPTION carries a name index**
   — `snake_name — first clause of the action's description`, one per line — instead of one first-class
   tool schema per action. The index is GENERATED from `listActions` in `buildToolset()` (cached per
@@ -758,10 +827,110 @@ turn (implicit cache expiring between turns). The two path lists inside `read_fi
 descriptions are the biggest single addition and are the first dial to turn if this needs shrinking —
 they buy the absence of a guess-and-retry round-trip.
 
+#### Computer-use — the same helpers, but only while the gate is on (2026-07-27)
+
+The Assistant reaches third-party apps through the **same four helpers** MCP uses
+(`nidara-a11y`/`nidara-act`/`nidara-type`/`nidara-click`, see the next section), with the **same
+tool names and parameters** (one addition: `query_app` takes a `match` — see the projection below).
+One vocabulary for the project: a verb added to the wrapper lands in both consumers with the same
+shape, and the section below documents both.
+
+Five things are specific to this consumer and are the whole content of the work:
+
+- **The gates decide what is OFFERED, not only what is refused.** `buildToolset()` appends
+  `query_app` only while `allowComputerUse` is on, and the ten action tools only while
+  `allowComputerControl` is too. Both ship OFF, so the common case pays nothing — measured on the
+  CI shell: fixed prefix **8,472 b → 9,384 b** with perception (+912 b), **→ 17,400 b** with control
+  (**+8,928 b ≈ +2,200 tokens on every step**). That number is the reason for the conditioning, not
+  a footnote to it. Perception-without-control is a real state and is offered as one: look at an
+  app and report, touch nothing.
+- **The gate is re-read at the TURN BOUNDARY** (`syncComputerGate()` in `runTurn`), which drops the
+  cached toolset AND system prompt when it changed. Without that, a user who grants permission
+  mid-conversation keeps talking to an assistant that was never told. Deliberately not mid-turn:
+  rebuilding between two steps of one request chain produces a `tool_result` for a tool the
+  provider was never offered.
+- **`helperResult()` marks a refusal as a FAILED result.** Every helper prints one JSON object
+  (`{error}` / `{ok:false}` / `{ok:true}`); MCP relays it as text, but three things here read `ok`
+  and all three are wrong otherwise — the island's tool chip (it would settle as success), the
+  two-strike repeat guard, and the model.
+- **A real accessibility tree does not fit in a chat, and `query_app` is projected because of it.
+  This was proven by a live failure, not predicted.** Asked to toggle Nautilus's sidebar, the
+  Assistant queried the window, never found the control, and invented an action name. The button
+  was there and perfectly described — `id:"Show Sidebar"`, `role:"toggle button"`,
+  `actions:["click"]` — at **node 157 of 175, byte 55,313 of 60,367**: past the cap.
+  **A positional cut loses the wrong end** — GTK walks content first and chrome last, so a file
+  list fills the budget and the header bar, where the buttons worth pressing live, is what falls
+  off. Four changes, none of which makes anything unreachable:
+  - **`match`** (substring over name/text/role) — the lever the truncation notice names. An empty
+    match reports how many nodes WERE scanned, so "nothing matched" is distinguishable from "the
+    window is empty". A matched look costs **~256 b**.
+  - **`match` takes alternation** — `"a|b"` keeps a node matching either, so the two ends of a drag
+    are one call. Added because the model wrote `match:"cs.svg|Trash"` unprompted and got five
+    empty results against the old plain-substring test (live, 2026-07-29). A literal `|` in a name
+    loses; that is the trade.
+  - **`showing` on a match with ≤ 8 hits, plus the PRICE of the alternative.** A filtered query
+    that found little is one step from the whole-window dump, and the model cannot see what that
+    costs: measured 2026-07-29, one such fallback on Telegram put 37 KB into the history and rode
+    every later step — **~78k of a 125k-token turn**, spent to learn that the button is called
+    *"Buscar mensajes"* (the UI is in Spanish; the model had matched `"search"`). So the result now
+    carries the on-screen labels and a hint naming the dump's size in KB, instead of the old hint
+    that recommended `without match` while saying nothing about its cost. **Control-first, not
+    document order** — same head-cut trap one level up: on the live Telegram tree, document order
+    spends 18 of its first 19 slots on table cells, while a role filter gives 16 names, all
+    controls, 401 b, target second. **But control-first is an ORDERING, not a filter** — the
+    remaining slots fill with everything else labelish, because in a chat window the content is
+    noise while in a **file manager the content is the target** (Nautilus draws items as
+    `table cell`/`table row`; a role-only list offered "Open Trash" and not the file to drag onto
+    it, and the model paid a 21 KB dump for the other half). Filling costs Nautilus 406 → 729 b
+    and Telegram 401 → 743 b. MCP clients are unaffected — this lives in the daemon's projection,
+    and they get the raw tree.
+  - **Leaned nodes** — drop what carries no targeting information: `window` (the same string on all
+    175 nodes; hoisted to the top), `type` (a duplicate of `role` in every node observed),
+    `visible` (already in `states`), and the states every node has (`sensitive`/`showing`/…).
+  - **`path` trimmed** to its last two links, each capped at 48 chars. It is the heaviest field —
+    51 KB of Nautilus's 102, **348 KB of Telegram's 503** — because the chain repeats for every
+    sibling and an ancestor's name can BE the content (a Telegram list item's accessible name is
+    the whole message, ~900 chars, echoed down every descendant). This consumer never navigates by
+    path; it targets name + role + occurrence.
+  - **Repeated siblings collapse** — first 3 of each `path`+`role` run, then a count. A file
+    manager's hundred rows are one *kind* of thing. Document order is preserved: reordering would
+    cost the model the only spatial information a flat list still carries.
+
+  Measured after: **Nautilus 102 KB → 27 KB, Telegram 503 KB → 19 KB, both arriving WHOLE** instead
+  of cut at the header bar. Orientation fields (`window`, `count`, `of_nodes`, `match`, `hint`) are
+  emitted FIRST — a notice appended after 30 KB of nodes sits behind everything else in the result.
+  The cap here is its own (`MAX_A11Y_RESULT`, 32 KB, sized from those measurements) because a
+  window's controls are the whole point of the tool. MCP clients keep the raw tree — they have the
+  context and pay once per call.
+- **A tool description must not model the thing it forbids.** The same live failure had a second
+  half: `do_app_action` was sent `win.toggle-sidebar` — a plausible GTK action name the model had
+  never seen — aimed at a panel whose `actions` array was empty. The description had offered *"or
+  an app action like `view.show-hidden-files`"* as an example, which is an invitation to invent
+  one. It now says the action must be COPIED from that node's own `actions`, and that a node with
+  none is `click_app`'s job.
+- **The descriptions are re-authored, not copied, and the reason is not brevity.** THIS CLIENT HAS
+  NO EYES. The MCP wording sends an agent to a screenshot to read what the tree cannot show; here
+  that is advice to stare at a PNG it will never receive. So `hover_app` says a tooltip's text is
+  unreachable *and to say so*, the `*_at` tools say coordinates come from a node's bounds and never
+  a guess, and the gated prompt block states once that `run_action screenshot` returns a **path**,
+  not a picture. Cross-cutting rules (focus first, preference order do_app_action → keyboard →
+  pointer → coordinates) live in that prompt block instead of being repeated in eleven schemas.
+
+Covered by CI (`agent-loop` scenario 4): both gate states, the positional argv handed to
+`nidara-click` (`role` omitted + `occurrence` given must pad with `""`, or the occurrence lands in
+the role slot and filters for a control whose role is `"2"`), the refusal-honesty flag, and every
+half of the projection. Its stub tree is the shape that broke it live — a long run of identical
+rows FIRST and the control the user asked for LAST — and the load-bearing assertion is that **the
+control after the list survives**. Each assertion was verified to FAIL when its line is removed,
+which is the only reason to believe any of them.
+
 ### The computer-use layer (third-party perception + action)
 
 The agent surface above is the shell controlling **itself**. The computer-use layer is the jump
-to perceiving and driving **any** third-party app. Phase 1 — perception, read-only:
+to perceiving and driving **any** third-party app. **Two consumers, one surface:** `nidara-mcp` for
+external agents and the built-in Assistant (above) — both spawn the same helpers with the same
+verbs, and the helpers are where every gate, focus check and kill-switch re-check lives. Add a verb
+here and it is one wrapper mode + one tool in each consumer. Phase 1 — perception, read-only:
 
 - **`bin/nidara-a11y`** (standalone GJS, `gi://Atspi`; same no-Node pattern as
   `nidara-mcp`/`nidara-portal`) reads an app's **AT-SPI2 accessibility tree** and prints
@@ -821,8 +990,13 @@ Qt buttons that only expose `SetFocus` → focus then press Enter/Space):
   `zwp_virtual_keyboard`, no daemon; SEPARATE binary, synthetic input never lives in the perceive
   or AT-SPI-action helpers). `nidara-type text <app> <string>` /
   `nidara-type key <app> <keyspec>` (`Return`, `Tab`, `ctrl+a`, `ctrl+shift+t`; `super`→`logo`).
-  MCP: `type_text` / `press_key`. The loop: `query_app` → `do_app_action … SetFocus` →
-  `type_text`/`press_key`.
+  MCP: `type_text` / `press_key`. The loop: `query_app` → `focus_window` →
+  `type_text`/`press_key`. **Two different kinds of focus, and confusing them cost a step in a
+  live run (2026-07-28):** the WINDOW must be Hyprland's active one and `focus_window` is the only
+  verb for that — `do_app_action … SetFocus` cannot do it. Focusing the CONTROL with `SetFocus`
+  works only where the toolkit exposes that action (Qt usually does; **GTK4 usually does not** — it
+  dropped ATK, `Component.GrabFocus` returns false and many nodes carry an empty action list). To
+  put a NUMBER in a field, don't aim a keyboard at all: `do_app_action … set-value=N`.
 - **Same gate as 2a** (`allowComputerControl` + the 2a indicator/kill switch) — no new toggle.
 - **SAFETY — focus-dependent**: `wtype` types into whatever window has focus (unlike `do_action`).
   So `<app>` is **required** and `nidara-type` **verifies it is Hyprland's active window**
@@ -837,7 +1011,11 @@ Qt buttons that only expose `SetFocus` → focus then press Enter/Space):
   config). **Ungated** — it's a window-manager op (see "Window & workspace management" above), as
   benign as a dock click; the keyboard/pointer tools it feeds stay gated and focus-verified. The
   full autonomous loop:
-  `focus_window telegram` → `do_app_action telegram "<field>" SetFocus` → `type_text telegram "…"`.
+  `focus_window telegram` → `do_app_action telegram "<field>" SetFocus` → `type_text telegram "…"`
+  (the middle step is the **Qt** case; on GTK4 it usually fails — go straight from `focus_window`
+  to `type_text`, or use `set-value` for a number). A refusal from `nidara-type`/`nidara-click`
+  now carries the target window's **address** in `focus`, so recovery is one `focus_window` call
+  and not the `list_windows` → `focus_window` → retry that a live run spent three steps on.
 
 Phase 2b-ii — **synthetic pointer (click, right-click, scroll, drag), built**, for what AT-SPI/keyboard
 can't reach (canvas, no-a11y surfaces, list items/tabs that need a real click, context menus,
@@ -876,6 +1054,18 @@ scrolling off-screen content, drag-and-drop / rubber-band selection / sliders):
   the AT-SPI tree held **zero** tooltip-role nodes before *and* after. So a hover can reveal state
   that a client without vision still cannot read — `screenshot` is the only way to that text.
   Controls a hover *reveals* are ordinary widgets and do appear in the tree.
+  **Two more measured facts, 2026-07-29 (tech-debt #38 (l)) — a hover HOLDS, and what it reveals
+  may not exist for AT-SPI.** The pointer is never moved back: `hyprctl cursorpos` still reported
+  the target seconds after the helper exited, and the revealed panel stayed open indefinitely. But
+  a hover is not a state we keep — it is a consequence of **which surface owns the pointer**, so
+  the moment a full-screen shell region returns the app gets a pointer LEAVE and the popup closes.
+  That is exactly what the **Activity Island's dismissal catcher** does (`setCatcher(true, 0)` →
+  a rect from y=0 to the full monitor height), re-stamped by `InputYield`'s `end()`. Hence the
+  sequence the agent is taught: **`setIsland closed` → `hover_app` → `query_app` → `setIsland
+  agent`**. And the second fact: **a Qt popup is as invisible as a GTK tooltip** — Telegram's emoji
+  panel, open on screen, was absent from two independent walks of its tree (398 → 401 nodes, all
+  four new ones unrelated, one window throughout). This is why `hover_app` does NOT read the tree
+  inside the truce: it would have returned nothing.
   **Correction (2026-07-27):** this file used to justify the absence of `drag-app` with *"a
   two-ended gesture doesn't map cleanly to the single-node `*-app` shape"*. It maps fine — the
   wrapper resolves both ends through the same `resolveNode()` before anything is pressed, and a

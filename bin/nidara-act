@@ -32,6 +32,7 @@
 
 import Atspi from "gi://Atspi"
 import GLib from "gi://GLib"
+import Gio from "gi://Gio"
 
 const AI_JSON = `${GLib.get_user_config_dir()}/nidara/ai.json`
 const MAX_NODES = 4000   // a match scan can touch more nodes than a perception cap
@@ -42,8 +43,17 @@ function emit(obj) { print(JSON.stringify(obj, null, 2)) }
 // Fire-and-forget: tell the shell an action just landed so the bar's AI-control
 // indicator shows its "active" pulse (decays back to "armed" after a few seconds).
 // Never blocks or fails the action if the shell isn't reachable.
+//
+// Gio, NOT spawn_command_line_async: the latter cannot redirect stdio, so the child
+// INHERITS ours and the `ags` CLI's reply ("ok") lands on OUR stdout — right after
+// the JSON we just printed. That breaks the one-JSON-per-helper contract the daemon
+// parses. Worst of all here, because we only ping when the action SUCCEEDED
+// (`result === true`): the tool reported failure exactly when it had worked.
 function pingShell() {
-    try { GLib.spawn_command_line_async("ags request notifyComputerAction") } catch {}
+    try {
+        Gio.Subprocess.new(["ags", "request", "notifyComputerAction"],
+            Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+    } catch {}
 }
 
 function safe(fn, fallback) {
@@ -103,16 +113,34 @@ function appMatches(appName, filter) {
     return appName.toLowerCase().includes(filter)
 }
 
+// A miss reports the names actually on screen, exactly as nidara-click does — the
+// two helpers are aimed by the SAME name, so a dead end in one is a dead end in
+// both. Measured 2026-07-28: `do_app_action Clocks "Hola Manola" SetFocus` missed
+// and the reply listed APPLICATIONS, which is the wrong question answered (the app
+// had matched); recovery cost a whole query_app round trip. The names are free —
+// nameOf() is already called for every node on this walk.
+//
+// The filter is the point, not a detail: an accessible name is not a label (in a
+// chat app it is the entire message — the same thing that made a raw a11y dump
+// 503 KB), so only short single-line names qualify. A suggestion list that costs
+// more than the round trip it saves is a regression. Keep these in step with
+// nidara-click's copies if you touch them.
+const MAX_SUGGESTIONS = 40
+const MAX_SUGGESTION_LEN = 48
+const isLabelish = nm => nm.length <= MAX_SUGGESTION_LEN && !nm.includes("\n")
+
 // Collect every showing node in the target app(s) whose name matches `nodeName`
 // (case-insensitive exact, then substring) and, if given, whose role matches.
 function findMatches(filter, nodeName, roleFilter) {
     const desktop = safe(() => Atspi.get_desktop(0), null)
-    if (!desktop) return { matches: [], apps: [] }
+    if (!desktop) return { matches: [], apps: [], showing: [], appFound: false }
 
     const want = nodeName.toLowerCase()
     const exact = []
     const partial = []
     const apps = []
+    const seen = new Set()
+    let appFound = false
     let scanned = 0
 
     const visit = (acc, depth) => {
@@ -121,6 +149,7 @@ function findMatches(filter, nodeName, roleFilter) {
         scanned++
         const nm = nameOf(acc)
         if (nm) {
+            if (seen.size < MAX_SUGGESTIONS && isLabelish(nm)) seen.add(nm)
             const role = roleOf(acc)
             if (!roleFilter || role === roleFilter) {
                 const low = nm.toLowerCase()
@@ -135,10 +164,11 @@ function findMatches(filter, nodeName, roleFilter) {
         const appName = nameOf(app) || "?"
         apps.push(appName)
         if (!appMatches(appName, filter)) continue
+        appFound = true
         for (const win of children(app)) visit(win, 0)
     }
     // Prefer exact-name matches; fall back to substring matches.
-    return { matches: exact.length ? exact : partial, apps }
+    return { matches: exact.length ? exact : partial, apps, showing: [...seen], appFound }
 }
 
 function describe(acc) {
@@ -159,15 +189,28 @@ function main() {
     const occurrence = occRaw === "" ? null : parseInt(occRaw, 10)
 
     if (!app || !nodeName || !action) {
-        emit({ error: "usage: nidara-act <app> <node-name> <action> [role] [occurrence]" })
+        emit({ error: "usage: nidara-act <app> <node-name> <action|set-value=N> [role] [occurrence]" })
         return
     }
 
     Atspi.init()
 
-    const { matches, apps } = findMatches(app.toLowerCase(), nodeName, roleFilter)
+    const { matches, apps, showing, appFound } = findMatches(app.toLowerCase(), nodeName, roleFilter)
     if (!matches.length) {
-        emit({ error: `no showing node named "${nodeName}"${roleFilter ? ` (role ${roleFilter})` : ""} found in app "${app}"`, apps })
+        // Two different misses, two different next questions. The app not matching
+        // is the only case where a list of APPLICATIONS is the answer; once the app
+        // is found, what the caller needs is the names on its screen.
+        if (!appFound) {
+            emit({ error: `no app matching "${app}" is running — \`apps\` lists the accessible applications right now`, apps })
+            return
+        }
+        emit({
+            error: `no showing node named "${nodeName}"${roleFilter ? ` (role ${roleFilter})` : ""} found in app "${app}"`
+                + (showing.length
+                    ? " — `showing` lists the short, single-line names on screen right now (control labels); pick one VERBATIM. Not there? The control may only appear once something else is set, or its name is long/multi-line — then use query_app with a match."
+                    : " — nothing label-like is showing; check the right window is focused, or use query_app to see the tree."),
+            showing,
+        })
         return
     }
     if (matches.length > 1 && occurrence === null) {
@@ -184,14 +227,57 @@ function main() {
         return
     }
 
+    // Two BUILT-IN verbs that are not AT-SPI "actions" at all, handled before the
+    // Action interface is consulted. They exist because of a measured dead end: a
+    // GTK4 spin button ("Minutes" in GNOME Clocks) exposes an EMPTY action list, so
+    // `SetFocus` failed, the agent typed the digits blind, and they landed on
+    // whatever had focus and concatenated with what was already there — asking for
+    // 7 minutes produced 11 h 40 min (= 700 minutes). Verified against a real
+    // GtkSpinButton 2026-07-28: `value=true component=true`, i.e. the number was
+    // always settable directly; only the Action interface was empty.
+    //
+    // `set-value=N` is strictly better than typing for anything numeric: no focus,
+    // no keystrokes, no accumulation, and it reports the value the widget actually
+    // took (clamped to its own min/max) rather than what we hoped it took.
+    const setValue = /^set-value=(-?\d+(?:\.\d+)?)$/.exec(action)
+    if (setValue) {
+        const want = parseFloat(setValue[1])
+        const val = safe(() => target.get_value_iface(), null)
+        if (!val) {
+            emit({ error: `node "${nodeName}" has no AT-SPI value to set (not a spin button / slider)`, node: describe(target) })
+            return
+        }
+        const ok = safe(() => Atspi.Value.prototype.set_current_value.call(val, want), false)
+        // Read back rather than trust the setter: a spin button clamps silently, and
+        // "it returned true" is not the same claim as "it now holds 7".
+        const got = safe(() => Atspi.Value.prototype.get_current_value.call(val), null)
+        if (ok === true) pingShell()
+        emit({ ok: ok === true && got === want, app, node: describe(target), action: "set-value",
+            requested: want, value: got,
+            ...(got !== want ? { note: "the widget clamped or rejected the value — check its min/max" } : {}) })
+        return
+    }
+    // NO `focus` VERB — do not add one back. `Atspi.Component.grab_focus` is the
+    // obvious companion to set-value, and it does not work: measured 2026-07-28
+    // against a live GtkSpinButton, it returns FALSE even with its own window
+    // already focused (`hyprctl activewindow` = the probe). GTK4 dropped ATK and
+    // its own AT-SPI backend does not implement Component.GrabFocus, so on the
+    // toolkit this desktop is built from the verb would fail every time — a tool
+    // that always returns false is worse than no tool, and it would cost prompt
+    // bytes on every request to say so. Focus a WINDOW with `focusWindow`; to put a
+    // value somewhere, set the value instead of aiming the keyboard at it.
+
+    // Every failure below advertises the built-in: the reason the timer went wrong
+    // was an agent that knew only `SetFocus` and had no way to learn otherwise.
+    const BUILTINS = ["set-value=<number>"]
     const { iface, names } = actionsOf(target)
     if (!iface) {
-        emit({ error: `node "${nodeName}" exposes no AT-SPI actions`, node: describe(target) })
+        emit({ error: `node "${nodeName}" exposes no AT-SPI actions`, node: describe(target), available: BUILTINS })
         return
     }
     const idx = names.findIndex(n => n === action)
     if (idx < 0) {
-        emit({ error: `action "${action}" not available on this node`, node: describe(target), available: names })
+        emit({ error: `action "${action}" not available on this node`, node: describe(target), available: [...names, ...BUILTINS] })
         return
     }
 

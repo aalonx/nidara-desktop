@@ -5,6 +5,7 @@ import Cairo from "gi://cairo"
 import GLib from "gi://GLib"
 import { MorphRevealer } from "../../common/MorphRevealer"
 import status from "../../core/Status"
+import inputYield from "../../core/InputYield"
 
 // The Activity Island's OWN layer surface — the one documented exception to
 // "overlays live inside the Bar's window" (skill commandment #5).
@@ -131,6 +132,15 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
         const surface = win.get_native()?.get_surface()
         if (!surface?.set_input_region) return
         const region = new Cairo.Region()
+        // Yielded for an agent action (core/InputYield): fully click-through, capsule
+        // included. This surface spans the WHOLE monitor, so leaving the panel's own
+        // rect stamped would still eat every synthetic click aimed at whatever sits
+        // behind the Assistant — the exact clicks the yield exists to let through.
+        if (inputYield.active) {
+            surface.set_input_region(region)
+            win.queue_draw()
+            return
+        }
         // compute_bounds against the root, NOT get_allocation(): the capsule is
         // nested (root > row > centre box > capsule) and a child's allocation is
         // relative to its parent, so an allocation would land the rect in the
@@ -162,6 +172,42 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
         surface.set_input_region(region)
         win.queue_draw()   // input regions are double-buffered: apply on next commit
     }
+
+    // What the island actually COVERS, monitor-relative — capsule plus whichever
+    // mode is revealed, which is exactly what `updateInputRegion` stamps minus the
+    // catcher (the catcher is a dismissal target, not something the user can see).
+    //
+    // This exists for the AGENT, not for layout. The Assistant lives in this island
+    // and was happily clicking controls that sit UNDERNEATH it: the click lands
+    // (the yield makes the surface click-through), but it happens where the user
+    // cannot see it, which reads as the assistant doing something behind their
+    // back. Reporting the rect lets it close the island first — see `setIsland`.
+    // Bounds are root-relative and the surface is exactly the monitor rect
+    // (exclusive_zone -1 above), so root-relative IS monitor-relative here.
+    const occupiedRect = (): { x: number, y: number, w: number, h: number, monitor: string } | null => {
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+        const add = (w: Gtk.Widget | null) => {
+            if (!w?.get_visible() || !w.get_mapped()) return
+            const [ok, b] = w.compute_bounds(root)
+            if (!ok || b.get_width() <= 1 || b.get_height() <= 1) return
+            x0 = Math.min(x0, b.get_x());              y0 = Math.min(y0, b.get_y())
+            x1 = Math.max(x1, b.get_x() + b.get_width()); y1 = Math.max(y1, b.get_y() + b.get_height())
+        }
+        add(hitTarget)
+        for (const r of revealers) add(r)
+        if (!isFinite(x0)) return null
+        // The connector name (DP-1, …) so a consumer on a multi-monitor setup can
+        // tell whether this rect is even on the output it is clicking — the numbers
+        // are monitor-LOCAL and would otherwise silently compare across screens.
+        return {
+            x: Math.round(x0), y: Math.round(y0),
+            w: Math.round(x1 - x0), h: Math.round(y1 - y0),
+            monitor: gdkmonitor.get_connector() ?? "",
+        }
+    }
+    // Stamped on the window so app.ts can reach it the same way it reaches the
+    // dock's app-grid state — by scanning `windows` for the named surface.
+    ;(win as any).occupiedRect = occupiedRect
 
     return {
         win,

@@ -253,7 +253,12 @@ const TOOLS = [
     {
         name: "do_app_action",
         description:
-            "Act on a THIRD-PARTY app by invoking a named accessibility action on a named control — deterministic, NO synthetic mouse/keyboard (the action the control exposes, e.g. \"activate\", \"SetFocus\", or a GTK action like \"view.show-hidden-files\"). Discover a node's name + available `actions` with query_app first, then act by name. GTK4 exposes rich actions; Qt often exposes only \"SetFocus\" (clicking such controls needs synthetic input, not yet available). Gated by Settings → AI → Allow Agents to Control Other Apps (off by default; requires perception). If multiple controls share the name, pass `role` and/or `occurrence` to disambiguate.",
+            // Kept in step with the built-in Assistant's wording (bin/nidara-agent),
+            // including the two lessons it paid for: an example action name invites
+            // the model to invent one (a live failure — `win.toggle-sidebar` sent to
+            // a node whose `actions` was empty), and a spin button carries a VALUE,
+            // not an action (typing into one blind turned "7 minutes" into 11h40).
+            "Act on a THIRD-PARTY app by invoking a named accessibility action on a named control — deterministic, NO synthetic mouse/keyboard. `action` must be COPIED from that node's own `actions` array as returned by query_app; never a name you have not seen there, however plausible. Discover the node with query_app first. SPECIAL: a node query_app reports with a `value` block (spin buttons, sliders — their `actions` is empty) is set with `action: \"set-value=<number>\"`; always prefer that over typing digits, since it needs no focus, cannot concatenate with what the field already holds, and reports the value the widget actually took. A node with an empty `actions` and no `value` cannot be driven this way — use click_app. Gated by Settings → AI → Allow Agents to Control Other Apps (off by default; requires perception). If multiple controls share the name, pass `role` and/or `occurrence` to disambiguate.",
         inputSchema: {
             type: "object",
             properties: {
@@ -285,7 +290,7 @@ const TOOLS = [
     {
         name: "type_text",
         description:
-            "Type literal text into a THIRD-PARTY app via synthetic keyboard (wtype) — for fields AT-SPI can't fill. Focus the target first (do_app_action … SetFocus). SAFETY: `app` is required and must be the FOCUSED window, else it refuses (keystrokes only land where you aimed). Does NOT press Enter — use press_key for that. Gated by Settings → AI → Allow Agents to Control Other Apps.",
+            "Type literal text into a THIRD-PARTY app via synthetic keyboard (wtype) — for fields AT-SPI can't fill. Focus the target WINDOW first with focus_window (not do_app_action … SetFocus: that is a control-level action, and GTK4 apps mostly do not expose it). SAFETY: `app` is required and must be the FOCUSED window, else it refuses (keystrokes only land where you aimed). Does NOT press Enter — use press_key for that. Gated by Settings → AI → Allow Agents to Control Other Apps.",
         inputSchema: {
             type: "object",
             properties: {
@@ -308,7 +313,7 @@ const TOOLS = [
     {
         name: "press_key",
         description:
-            "Press a key or combo in a THIRD-PARTY app via synthetic keyboard (wtype) — e.g. \"Return\", \"Tab\", \"Escape\", \"ctrl+a\", \"ctrl+shift+t\". Activates a focused control (Enter/Space), navigates (Tab), etc. Focus the target first (do_app_action … SetFocus). SAFETY: `app` is required and must be the FOCUSED window, else it refuses. Gated by Settings → AI → Allow Agents to Control Other Apps.",
+            "Press a key or combo in a THIRD-PARTY app via synthetic keyboard (wtype) — e.g. \"Return\", \"Tab\", \"Escape\", \"ctrl+a\", \"ctrl+shift+t\". Activates a focused control (Enter/Space), navigates (Tab), etc. Focus the target WINDOW first with focus_window (not do_app_action … SetFocus: that is a control-level action, and GTK4 apps mostly do not expose it). SAFETY: `app` is required and must be the FOCUSED window, else it refuses. Gated by Settings → AI → Allow Agents to Control Other Apps.",
         inputSchema: {
             type: "object",
             properties: {
@@ -400,7 +405,7 @@ const TOOLS = [
     {
         name: "hover_app",
         description:
-            "Move the pointer over a control in a THIRD-PARTY app WITHOUT pressing anything — the way to reach state that does not exist until the pointer is there: tooltips, hover-revealed buttons, menus that open on hover. Read the result AFTER hovering: revealed CONTROLS are ordinary widgets and show up in query_app, but a GTK TOOLTIP is drawn without being an accessibility node (measured on GTK4) — query_app will not see it, so read tooltip text with screenshot instead. Focus the window first (focus_window). SAFETY: `app` must be the focused window. Gated by Settings → AI → Allow Agents to Control Other Apps.",
+            "Move the pointer over a control in a THIRD-PARTY app WITHOUT pressing anything — the way to reach state that does not exist until the pointer is there: tooltips, hover-revealed buttons, menus that open on hover. Read the result AFTER hovering: the pointer stays put, so what appeared stays open, and revealed CONTROLS are ordinary widgets that show up in query_app. What does NOT: a GTK TOOLTIP (measured on GTK4) and Qt popups (measured — Telegram's emoji panel was open on screen and absent from its whole tree); read those with screenshot instead. A shell overlay that covers the screen (Nidara's Activity Island while open) takes the pointer back the moment it returns, which closes whatever the hover revealed — check dumpState.overlays.islandBounds if a hover seems not to stick. Focus the window first (focus_window). SAFETY: `app` must be the focused window. Gated by Settings → AI → Allow Agents to Control Other Apps.",
         inputSchema: {
             type: "object",
             properties: {

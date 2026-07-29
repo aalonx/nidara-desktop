@@ -121,6 +121,42 @@ function visual(cmd, wait = true) {
     } catch {}
 }
 
+// Ask the shell to step out of the way for this action, and hand the keyboard back
+// after. Unlike `visual` above this is NOT cosmetic. While one of Nidara's own layer
+// surfaces holds an EXCLUSIVE keyboard grab — which the Assistant island does the
+// entire time the user is typing at it — Hyprland refuses to move window focus at
+// all (FocusState.cpp: "Refusing a keyboard focus to a window because of an exclusive
+// ls") AND routes the pointer to that surface regardless of its input region. So from
+// inside the Assistant the focus check below could never pass, and the click would
+// have been swallowed even if it had. `begin` answers only once the compositor has
+// APPLIED the release, so it is deliberately synchronous. A shell that is down, or
+// too old to know the command, is a silent no-op — exactly the behaviour that existed
+// before this; and if we die before `end`, the shell restores itself.
+//
+// `begin` also answers with the Activity Island's covered rect, which is why it is
+// worth reading the reply: the Assistant lives in that island and cannot see it, so
+// it happily resolves controls sitting UNDERNEATH its own panel. Those clicks land
+// (the yield makes the surface click-through) but they land where the user has no
+// way to watch, which is indistinguishable from the assistant acting behind their
+// back. Reported, not refused — the click is legitimate, it is the invisibility
+// that needs saying.
+function yieldInput(verb) {
+    try {
+        const [ok, out] = GLib.spawn_command_line_sync(`timeout 3 ags request -- yieldInput ${verb}`)
+        if (!ok || !out) return null
+        return JSON.parse(new TextDecoder().decode(out).trim())
+    } catch { return null }
+}
+
+// Is an output-relative point inside the island's covered rect? Both are
+// monitor-LOCAL, so the monitor has to match or this compares across screens.
+function underIsland(bounds, outX, outY, monName) {
+    if (!bounds) return false
+    if (bounds.monitor && monName && bounds.monitor !== monName) return false
+    return outX >= bounds.x && outX < bounds.x + bounds.w
+        && outY >= bounds.y && outY < bounds.y + bounds.h
+}
+
 // nidara-input: PATH first, then a sibling of this script (dev checkout).
 function findInjector() {
     const inPath = GLib.find_program_in_path("nidara-input")
@@ -152,19 +188,40 @@ function centreOf(acc) {
     if (!r) return null
     return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), role: roleOf(acc) }
 }
+// How many real node names a failed lookup reports back. A miss used to be a dead
+// end ("no showing node named X"), and the model's only recovery was to spend a
+// whole round trip on query_app — measured 2026-07-28 in a live run: two of eleven
+// calls were guesses ("page tab", "Start") that bought nothing. The names cost
+// NOTHING to collect: `nameOf(acc)` is already called for every node on this walk.
+const MAX_SUGGESTIONS = 40
+
+// …but ONLY the ones that could plausibly be a control. An accessible name is not a
+// label: in a chat app it is the ENTIRE MESSAGE (measured on Telegram — this is the
+// same thing that made a raw a11y dump 503 KB). A button label is short and
+// single-line; a content blob is neither. Filtering here rather than at emit time
+// also bounds what the walk accumulates, instead of holding a megabyte to print 40
+// items. A suggestion list that costs more than the round trip it saves is a
+// regression, so keep this filter honest if you widen it.
+const MAX_SUGGESTION_LEN = 48
+const isLabelish = nm => nm.length <= MAX_SUGGESTION_LEN && !nm.includes("\n")
+
 function findNodeCentres(appFilter, nodeName, roleFilter) {
     const desktop = safe(() => Atspi.get_desktop(0), null)
-    if (!desktop) return []
+    if (!desktop) return { hits: [], seen: [] }
     const want = nodeName.toLowerCase(), exact = [], partial = []
+    const seen = new Set()
     let scanned = 0
     const visit = (acc, depth) => {
         if (scanned >= MAX_NODES || depth > MAX_DEPTH || !isShowing(acc)) return
         scanned++
         const nm = nameOf(acc)
-        if (nm && (!roleFilter || roleOf(acc) === roleFilter)) {
-            const low = nm.toLowerCase()
-            if (low === want) { const c = centreOf(acc); if (c) exact.push(c) }
-            else if (low.includes(want)) { const c = centreOf(acc); if (c) partial.push(c) }
+        if (nm) {
+            if (seen.size < MAX_SUGGESTIONS && isLabelish(nm)) seen.add(nm)
+            if (!roleFilter || roleOf(acc) === roleFilter) {
+                const low = nm.toLowerCase()
+                if (low === want) { const c = centreOf(acc); if (c) exact.push(c) }
+                else if (low.includes(want)) { const c = centreOf(acc); if (c) partial.push(c) }
+            }
         }
         for (const k of children(acc)) visit(k, depth + 1)
     }
@@ -172,7 +229,7 @@ function findNodeCentres(appFilter, nodeName, roleFilter) {
         if (!nameOf(app).toLowerCase().includes(appFilter)) continue
         for (const win of children(app)) visit(win, 0)
     }
-    return exact.length ? exact : partial
+    return { hits: exact.length ? exact : partial, seen: [...seen] }
 }
 
 // CLI mode → injector verb (`action`) + how the target position is resolved
@@ -199,8 +256,20 @@ const MODES = {
 // names WHICH end failed, which only matters for drag-app's two of them.
 function resolveNode(appFilter, app, label, nodeName, role, occRaw) {
     const where = label ? `${label} node ` : "node "
-    const hits = findNodeCentres(appFilter, nodeName, role)
-    if (!hits.length) { emit({ error: `no showing ${where}named "${nodeName}" in "${app}"` }); return null }
+    const { hits, seen } = findNodeCentres(appFilter, nodeName, role)
+    if (!hits.length) {
+        // Answer the next question in the same breath. `showing` is what is on screen
+        // RIGHT NOW, which is also the honest reason a name can be correct and still
+        // missing (a control that only appears once something else is set).
+        emit({
+            error: `no showing ${where}named "${nodeName}" in "${app}"`
+                + (seen.length
+                    ? " — `showing` lists the short, single-line names on screen right now (control labels); pick one VERBATIM. Not there? The control may only appear once something else is set, or its name is long/multi-line — then use query_app with a match."
+                    : " — nothing label-like is showing; check the right window is focused, or use query_app to see the tree."),
+            showing: seen,
+        })
+        return null
+    }
     if (hits.length > 1 && occRaw === "") {
         emit({ error: `ambiguous: ${hits.length} nodes match the ${where}"${nodeName}" — pass a role and/or occurrence`,
             candidates: hits.slice(0, 20) })
@@ -224,6 +293,18 @@ function main() {
         emit({ error: "usage: nidara-click app|rclick-app|hover-app <app> <node> [role] [occurrence] | at|rclick-at|hover-at <app> <x> <y> | scroll-app <app> <node> <dx> <dy> [role] [occurrence] | scroll-at <app> <x> <y> <dx> <dy> | drag-app <app> <from-node> <to-node> [from-role] [from-occurrence] [to-role] [to-occurrence] | drag-at <app> <x1> <y1> <x2> <y2>" })
         return
     }
+    // Past the guards, so this call is going to act: make room for it. The yield
+    // must wrap the FOCUS CHECK too, not just the injection — before the shell lets
+    // go, the check cannot pass by construction (see yieldInput).
+    const yielded = yieldInput("begin")
+    try {
+        return act(mode, app, spec, yielded?.islandBounds ?? null)
+    } finally {
+        yieldInput("end")
+    }
+}
+
+function act(mode, app, spec, islandBounds) {
     const isScroll = spec.action === "scroll"
     const isDrag = spec.action === "drag"
 
@@ -234,7 +315,21 @@ function main() {
     const focused = activeClass && (activeClass.includes(a) || a.includes(activeClass) ||
         (activeClass.split(".").pop() || "").includes(a))
     if (!focused) {
-        emit({ error: `refused: "${app}" is not the focused window (active: ${activeClass || "unknown"}) — focus it first (focus_window)`, active: activeClass })
+        // Hand back the address of the window that WAS meant, so recovery is one
+        // step instead of three (list_windows → focus_window → retry, measured in a
+        // live run 2026-07-28). Only on this path — the happy path must not pay for
+        // a second hyprctl call. Kept identical in nidara-type.
+        const clients = runJson("hyprctl clients -j") || []
+        const hit = clients.find(w => {
+            const c = (w.class || "").toLowerCase()
+            return c && (c.includes(a) || a.includes(c) || (c.split(".").pop() || "").includes(a))
+        })
+        emit({
+            error: `refused: "${app}" is not the focused window (active: ${activeClass || "unknown"}) — focus the WINDOW first with focus_window`
+                + (hit ? ` (address ${hit.address}), then retry` : `; it is not open — run_action list_windows to see what is`),
+            active: activeClass,
+            ...(hit ? { focus: { address: hit.address, class: hit.class, title: hit.title } } : {}),
+        })
         return
     }
 
@@ -354,9 +449,14 @@ function main() {
         emit({ ok: false, error: `nidara-input failed: ${(err || "").trim() || "no output"}` }); return
     }
     pingShell()
+    // The action SUCCEEDED — this is a visibility warning, not a failure. See
+    // yieldInput: the click lands, but under the Assistant's own panel the user
+    // cannot see it happen.
+    const hidden = underIsland(islandBounds, outX, outY, mon.name)
     emit({ ok: true, app, mode, target: { outX, outY, extW, extH },
         ...(isScroll ? { scroll: { dx, dy } } : {}),
-        ...(isDrag ? { drop: { outX2, outY2 } } : {}), window: { at, monitor: mon.name } })
+        ...(isDrag ? { drop: { outX2, outY2 } } : {}), window: { at, monitor: mon.name },
+        ...(hidden ? { warning: "this landed UNDER the Activity Island, where the user cannot see it — run `setIsland closed` before acting in that area, then reopen with `setIsland agent` when you are done", islandBounds } : {}) })
 }
 
 main()

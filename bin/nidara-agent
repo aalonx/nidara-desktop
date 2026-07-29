@@ -211,6 +211,74 @@ function fileGate(mode) {
     return null
 }
 
+// ── Computer-use frontier (third-party apps) ─────────────────────────────────
+// Perceiving and driving OTHER applications does not go through `ags request`
+// either — it goes through the four standalone helpers the MCP server already
+// uses (nidara-a11y / nidara-act / nidara-type / nidara-click). Same reasoning as
+// the file layer, plus one that is specific to these: AT-SPI calls are synchronous
+// D-Bus and can hang, which is exactly why they live in short-lived processes and
+// not on the shell's main loop.
+//
+// The helpers own the enforcement — each re-reads ai.json, verifies the target is
+// the focused window, plays the AI-cursor choreography and honours the kill switch
+// mid-animation. So the assistant is the SAME kind of client here as MCP is, and
+// gets all of that for free. What this file adds is the two things a conversation
+// needs and a protocol adapter doesn't: tools shaped for a model with no eyes, and
+// an honest `ok` flag (see helperResult).
+//
+// The gates decide what is OFFERED, not just what is refused — see buildToolset.
+// A model told about a tool it cannot use promises the user something it cannot
+// deliver, and pays for the schema on every step to do it.
+function computerGate() {
+    const cfg = readAiJson()
+    const see = cfg.allowComputerUse === true
+    return { see, act: see && cfg.allowComputerControl === true }
+}
+
+// The gate state the cached toolset + system prompt were built from. Both are
+// built once per session; if the user grants or revokes permission mid-session,
+// both have to be thrown away or the model keeps the picture it was given at
+// spawn. Called at the turn boundary (see runTurn).
+let builtGateSig = null
+function syncComputerGate() {
+    const g = computerGate()
+    const sig = `${g.see}/${g.act}`
+    if (sig === builtGateSig) return g
+    if (builtGateSig !== null) {
+        log(`computer-use gate changed (${builtGateSig} → ${sig}) — rebuilding toolset and system prompt`)
+        systemCache = null
+        toolsetCache = null
+    }
+    builtGateSig = sig
+    return g
+}
+
+const GATE_SEE_OFF =
+    "Seeing other apps is turned off. The user can enable it in Settings → AI → \"Allow Agents to See Other Apps\"."
+const GATE_ACT_OFF =
+    "Controlling other apps is turned off. The user can enable it in Settings → AI → \"Allow Agents to Control Other Apps\" (it needs seeing them too)."
+
+// Dev-checkout pointer written by `install.sh --dev` (absent on system installs).
+function devRepo() {
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`${HOME}/.config/nidara/.dev`)
+        if (ok) return new TextDecoder().decode(bytes).trim() || null
+    } catch {}
+    return null
+}
+
+// PATH first, dev checkout second — same order as nidara-mcp's findTool and as
+// AgentService.resolveDaemon: a dev machine may not have re-run install.sh since
+// a helper was added, and the repo copy is the one being worked on.
+function findTool(name) {
+    const inPath = GLib.find_program_in_path(name)
+    if (inPath) return inPath
+    const repo = devRepo()
+    if (repo && GLib.file_test(`${repo}/bin/${name}`, GLib.FileTest.IS_EXECUTABLE))
+        return `${repo}/bin/${name}`
+    return null
+}
+
 // Run a command synchronously, capturing stdout+stderr. Used for the fast
 // `ags request` calls (system-prompt build + tool execution); the slow leg (the
 // LLM stream) is async curl so cancel still works mid-turn.
@@ -284,13 +352,8 @@ const emitDelta = (text) => { if (text) { deltasEmitted++; emit({ t: "delta", te
 // the installed copy, so editing a skill in the repo takes effect without an
 // install.
 function skillsDir() {
-    try {
-        const [ok, bytes] = GLib.file_get_contents(`${HOME}/.config/nidara/.dev`)
-        if (ok) {
-            const dir = `${new TextDecoder().decode(bytes).trim()}/skills`
-            if (GLib.file_test(dir, GLib.FileTest.IS_DIR)) return dir
-        }
-    } catch {}
+    const repo = devRepo()
+    if (repo && GLib.file_test(`${repo}/skills`, GLib.FileTest.IS_DIR)) return `${repo}/skills`
     return "/usr/share/nidara/skills"
 }
 
@@ -470,6 +533,193 @@ const STATIC_TOOL_DEFS = [
     },
 ]
 
+// ── Computer-use tools ───────────────────────────────────────────────────────
+// Appended by buildToolset ONLY while the matching gate is on, so the common
+// case (both off, the shipped default) pays nothing for them.
+//
+// Same NAMES and parameters as the MCP tools — one vocabulary for the whole
+// project, so the computer-use section of the skill documents both consumers and
+// a verb added to the wrapper lands in both with the same shape.
+//
+// The DESCRIPTIONS are re-authored rather than copied, for two reasons that both
+// come from this being a conversation and not a protocol adapter:
+//   1. Every byte rides on every step of every turn here, while an MCP client
+//      pays for the list once per session. Hence terse — and the cross-cutting
+//      rules (focus first, preference order) are stated ONCE in the system
+//      prompt instead of repeated in eleven schemas.
+//   2. THIS CLIENT HAS NO EYES. The MCP wording sends an agent to a screenshot
+//      to read what the tree cannot show; here that would be advice to stare at
+//      a PNG it cannot see. Where vision is the only answer, these say so.
+const SEE_TOOL_DEFS = [
+    {
+        name: "query_app",
+        description:
+            "Look inside ANOTHER application's window through its accessibility tree: a flat list of controls with role, name, text, the actions each one exposes, and window-relative bounds. This is how you see outside Nidara — you have no other view of another app. Targets the focused window unless you pass `app`. A real window holds hundreds of controls, so pass `match` when you know what you are after; a match that finds little answers with `showing`, the labels on screen — read those before asking for a whole window. Some toolkits expose little or nothing; if the tree comes back empty, say so rather than acting blind.",
+        props: {
+            app: { type: "string", description: "App name substring; omit for the focused window" },
+            match: { type: "string", description: "Keep only controls whose name, text or role CONTAINS this (substring, not a regex). \"a|b\" keeps either — ask for both ends of a drag in one call" },
+        },
+        required: [],
+    },
+]
+
+const ACT_TOOL_DEFS = [
+    {
+        name: "do_app_action",
+        description:
+            "Invoke an accessibility action on a control. Deterministic and not focus-dependent — the FIRST choice for acting on another app. "
+            // A live failure, 2026-07-27: asked to toggle Nautilus's sidebar, the
+            // model sent `win.toggle-sidebar` to a panel — a plausible GTK action
+            // name it had never seen, on a node whose `actions` array was empty.
+            // The old wording offered "an app action like view.show-hidden-files"
+            // as an example, which is precisely an invitation to invent one. Both
+            // halves of the rule matter: the action is COPIED from the node's own
+            // list, and the node has to be one that owns it.
+            + "`action` must be COPIED from that node's own `actions` array as returned by query_app — never a name you have not seen there, however plausible it sounds. "
+            + "A node whose `actions` is empty cannot be driven this way — with ONE exception below. Add `role`/`occurrence` when several controls share a name. "
+            // The 11h40m bug, 2026-07-28: asked for a 7-minute timer, the model
+            // found GNOME Clocks' "Minutes" spin button, saw an EMPTY actions array,
+            // could not focus it (GTK4 exposes no focus action), typed "7" blind,
+            // and the digits landed on whatever had focus and concatenated with what
+            // was already there — 700 minutes. Spin buttons and sliders carry a
+            // VALUE, not an action; query_app now reports it, and this is how it is
+            // written. Say so here or the model has no way to connect the two.
+            + "SPECIAL: for a node that query_app reports with a `value` block (spin buttons, sliders — their `actions` is empty), pass `action: \"set-value=<number>\"` to set it directly. "
+            + "ALWAYS prefer this over typing digits: it needs no focus, cannot concatenate with what is already in the field, and it reports back the value the widget actually took (it clamps to its own min/max).",
+        props: {
+            app: { type: "string", description: "App name substring" },
+            node: { type: "string", description: "Accessible name of the control, from query_app" },
+            action: { type: "string", description: "Copied from that control's `actions` array" },
+            role: { type: "string", description: "Disambiguate by role (e.g. \"button\")" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node", "action"],
+    },
+    {
+        name: "type_text",
+        description:
+            "Type literal text into another app with a synthetic keyboard, for fields no accessibility action can fill. The app must be the FOCUSED window — focus it with run_action focus_window, never with SetFocus (that is a control-level action most GTK4 apps do not have). To put a NUMBER in a field, prefer do_app_action with action=\"set-value=N\". Does NOT press Enter — that is press_key.",
+        props: {
+            app: { type: "string", description: "App name" },
+            text: { type: "string", description: "Literal text to type" },
+        },
+        required: ["app", "text"],
+    },
+    {
+        name: "press_key",
+        description:
+            "Press a key or combo in another app: \"Return\", \"Tab\", \"Escape\", \"ctrl+a\". Activates the focused control, moves between fields, closes a dialog.",
+        props: {
+            app: { type: "string", description: "App name" },
+            key: { type: "string", description: "Key or combo, e.g. Return, Tab, ctrl+a" },
+        },
+        required: ["app", "key"],
+    },
+    {
+        name: "click_app",
+        description:
+            "Click a control with a synthetic pointer, aimed at the centre the accessibility tree reports for it. For controls that expose no usable action (list items, tabs, drawn widgets); prefer do_app_action when one exists. `button:\"right\"` opens its context menu.",
+        props: {
+            app: { type: "string", description: "App name" },
+            node: { type: "string", description: "Accessible name of the control, from query_app" },
+            button: { type: "string", enum: ["left", "right"], description: "Default left" },
+            role: { type: "string", description: "Disambiguate by role" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node"],
+    },
+    {
+        name: "click_at",
+        description:
+            "Click a point measured in pixels from the window's top-left. Only for surfaces with no control to name (a canvas, a custom-drawn view). Take the numbers from a query_app node's bounds — you cannot see the screen, so a guessed coordinate clicks something unknown.",
+        props: {
+            app: { type: "string", description: "App name" },
+            x: { type: "integer", description: "X from the window's top-left" },
+            y: { type: "integer", description: "Y from the window's top-left" },
+            button: { type: "string", enum: ["left", "right"], description: "Default left" },
+        },
+        required: ["app", "x", "y"],
+    },
+    {
+        name: "hover_app",
+        description:
+            "Move the pointer onto a control without pressing anything — the only way to reach state that does not exist until the pointer is there: hover-revealed buttons, menus that open on hover. The pointer STAYS there afterwards, so what appeared stays open; query_app then reads it — but only if the toolkit publishes it. A tooltip never is one, and neither is a Qt popup (measured: Telegram's emoji panel, open on screen, was absent from its whole tree). If query_app cannot see what you revealed, tell the user you cannot read it instead of guessing.",
+        props: {
+            app: { type: "string", description: "App name" },
+            node: { type: "string", description: "Accessible name of the control, from query_app" },
+            role: { type: "string", description: "Disambiguate by role" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node"],
+    },
+    {
+        name: "hover_at",
+        description:
+            "Hover a window-relative point — hover_app for surfaces with no control to name. Coordinates come from query_app bounds, never a guess.",
+        props: {
+            app: { type: "string", description: "App name" },
+            x: { type: "integer", description: "X from the window's top-left" },
+            y: { type: "integer", description: "Y from the window's top-left" },
+        },
+        required: ["app", "x", "y"],
+    },
+    {
+        name: "scroll_app",
+        description:
+            "Scroll with a synthetic wheel, pointer over a named control — how you bring off-screen rows into the tree so query_app can see them.",
+        props: {
+            app: { type: "string", description: "App name" },
+            node: { type: "string", description: "Accessible name of the control to scroll over" },
+            direction: { type: "string", enum: ["up", "down", "left", "right"], description: "Scroll direction" },
+            amount: { type: "integer", description: "Wheel notches (default 3)" },
+            role: { type: "string", description: "Disambiguate by role" },
+            occurrence: { type: "integer", description: "0-based index among matches" },
+        },
+        required: ["app", "node", "direction"],
+    },
+    {
+        name: "scroll_at",
+        description:
+            "Scroll with the pointer over a window-relative point — scroll_app for surfaces with no control to name. The point decides which scrollable region gets the wheel.",
+        props: {
+            app: { type: "string", description: "App name" },
+            x: { type: "integer", description: "X from the window's top-left" },
+            y: { type: "integer", description: "Y from the window's top-left" },
+            direction: { type: "string", enum: ["up", "down", "left", "right"], description: "Scroll direction" },
+            amount: { type: "integer", description: "Wheel notches (default 3)" },
+        },
+        required: ["app", "x", "y", "direction"],
+    },
+    {
+        name: "drag_app",
+        description:
+            "Drag from one named control onto another: press, glide, release. Drag-and-drop between lists, a file onto a folder. Both ends are resolved before anything is pressed.",
+        props: {
+            app: { type: "string", description: "App name" },
+            from_node: { type: "string", description: "Accessible name of the control to drag FROM" },
+            to_node: { type: "string", description: "Accessible name of the control to drop ON" },
+            from_role: { type: "string", description: "Disambiguate the FROM control by role" },
+            from_occurrence: { type: "integer", description: "Disambiguate the FROM control by index" },
+            to_role: { type: "string", description: "Disambiguate the TO control by role" },
+            to_occurrence: { type: "integer", description: "Disambiguate the TO control by index" },
+        },
+        required: ["app", "from_node", "to_node"],
+    },
+    {
+        name: "drag_at",
+        description:
+            "Drag between two window-relative points: rubber-band selection, moving a slider handle, reordering. Use drag_app when both ends are named controls; coordinates come from query_app bounds.",
+        props: {
+            app: { type: "string", description: "App name" },
+            from_x: { type: "integer", description: "Start X from the window's top-left" },
+            from_y: { type: "integer", description: "Start Y from the window's top-left" },
+            to_x: { type: "integer", description: "Drop X from the window's top-left" },
+            to_y: { type: "integer", description: "Drop Y from the window's top-left" },
+        },
+        required: ["app", "from_x", "from_y", "to_x", "to_y"],
+    },
+]
+
 // IPC action name (camelCase) → wire tool name (snake_case). Function-calling
 // convention is snake_case, and matching it is what stops the model inventing
 // `list_apps` for `listApps`.
@@ -482,7 +732,14 @@ const toSnake = (s) => s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
 let toolsetCache = null   // { defs, actionMap: { snake: camel } }
 function buildToolset() {
     if (toolsetCache) return toolsetCache
+    const gate = computerGate()
     const defs = [...STATIC_TOOL_DEFS]
+    // Offered, not merely permitted. Both gates ship OFF, so this is the common
+    // case paying nothing — and when one is on, the model is told exactly the
+    // half it has (perception without control is a real, useful state: look at
+    // an app and report, touch nothing).
+    if (gate.see) defs.push(...SEE_TOOL_DEFS)
+    if (gate.act) defs.push(...ACT_TOOL_DEFS)
     const actionMap = {}
     const index = []
     try {
@@ -567,6 +824,20 @@ function summarizeTool(tu) {
         case "write_file": return `write_file ${prettyPath(i.path)}`
         case "load_skill": return `load_skill ${i.name || "?"}`
         case "run_action": return `run_action ${i.action || "?"}${Array.isArray(i.args) && i.args.length ? " " + i.args.join(" ") : ""}`
+        // Computer-use chips name the APP first: on a capsule this narrow, "which
+        // app is it touching" is the part the user is actually watching for.
+        case "query_app": return `query_app ${i.app || "(focused)"}${i.match ? ` "${truncate(String(i.match), 20)}"` : ""}`
+        case "do_app_action": return `do_app_action ${i.app} ${truncate(String(i.node ?? ""), 24)} ${i.action}`
+        case "type_text": return `type_text ${i.app} "${truncate(String(i.text ?? ""), 24)}"`
+        case "press_key": return `press_key ${i.app} ${i.key}`
+        case "click_app":
+        case "hover_app": return `${tu.name} ${i.app} ${truncate(String(i.node ?? ""), 24)}`
+        case "click_at":
+        case "hover_at": return `${tu.name} ${i.app} ${i.x},${i.y}`
+        case "scroll_app": return `scroll_app ${i.app} ${truncate(String(i.node ?? ""), 20)} ${i.direction}`
+        case "scroll_at": return `scroll_at ${i.app} ${i.x},${i.y} ${i.direction}`
+        case "drag_app": return `drag_app ${i.app} ${truncate(String(i.from_node ?? ""), 16)} → ${truncate(String(i.to_node ?? ""), 16)}`
+        case "drag_at": return `drag_at ${i.app} ${i.from_x},${i.from_y} → ${i.to_x},${i.to_y}`
         default: return tu.name
     }
 }
@@ -579,12 +850,18 @@ function summarizeTool(tu) {
 
 // Applied to EVERY tool result. See MAX_TOOL_RESULT: the cost of a fat result is
 // paid again on every later request of the conversation, not just once.
-const capResult = (res) =>
+//
+// `advice` exists because a truncation notice that names the wrong lever is worse
+// than none: it tells the model to do something the tool cannot do, and the same
+// breath forbids re-running. The default fits the file tools (they page); a tool
+// with a different lever passes its own.
+const CAP_ADVICE = "Narrow the request (a line range, a tighter pattern) — do not re-run this unchanged."
+const capResult = (res, advice = CAP_ADVICE) =>
     res.content && res.content.length > MAX_TOOL_RESULT
         ? {
             ...res,
             content: res.content.slice(0, MAX_TOOL_RESULT)
-                + `\n… truncated at ${MAX_TOOL_RESULT} characters. Narrow the request (a line range, a tighter pattern) — do not re-run this unchanged.`,
+                + `\n… truncated at ${MAX_TOOL_RESULT} characters. ${advice}`,
         }
         : res
 
@@ -809,6 +1086,290 @@ function editFileTool(path, oldText, newText) {
     return commitWrite(path, after, `Assistant: edited ${GLib.path_get_basename(path)}`)
 }
 
+// ── Computer-use tool implementations ────────────────────────────────────────
+// Each is a fixed-argv spawn of one helper. Every helper prints exactly ONE JSON
+// object — `{error:…}`, `{ok:false,…}` or `{ok:true,…}` — and that is what makes
+// the flag below possible.
+
+// Report a refusal or a failure as a FAILED tool result instead of an "ok" that
+// happens to contain an error. Three things downstream read `ok` and all three
+// are wrong otherwise: the island's tool chip (it would settle as success), the
+// two-strike guard (a call that fails identically twice must abort the turn, and
+// it compares failures), and the model itself.
+function helperResult(name, argv) {
+    const bin = findTool(name)
+    if (!bin) return {
+        ok: false,
+        content: `${name} is not installed on this system — tell the user to re-run install.sh; do not try another way.`,
+    }
+    const r = run([bin, ...argv])
+    if (!r.out) return { ok: false, content: `${name} produced no output${r.err ? `: ${r.err}` : ""}` }
+    let failed = false
+    try {
+        const parsed = JSON.parse(r.out)
+        failed = parsed?.error != null || parsed?.ok === false
+    } catch {
+        // Not JSON at all: the helper is broken or something else answered.
+        // Treat it as a failure rather than feeding the model an opaque blob.
+        failed = true
+    }
+    return { ok: !failed, content: compactJson(r.out) }
+}
+
+// A real accessibility tree does not fit in a chat-sized context, and this is not
+// a tuning detail — measured on a live session (2026-07-27): Nautilus is 102 KB
+// compacted, Telegram 503 KB, against a 24 KB tool-result cap. Handing the model a
+// blind 24 KB cut is not perception, it is noise with a cliff in the middle. Two
+// projections make the tool usable, and neither makes anything unreachable:
+//
+//   - `match` filters nodes by name / text / role substring — asking a question
+//     instead of downloading the building. It is the lever the truncation notice
+//     names, so the model always has a next move.
+//   - each node is LEANED and the ancestor `path` trimmed (last two links, each
+//     capped): dropped are the fields that carry no targeting information — the
+//     `window` string repeated on all 175 nodes, `type` (a duplicate of `role`
+//     in every node observed), `visible` (already in `states`), and the states
+//     every node has (`sensitive`/`showing`/…). The path is the single heaviest
+//     field — 51 KB of Nautilus's 102 KB, 348 KB of Telegram's 503 KB, because
+//     the chain repeats for every sibling and an ancestor's name can BE the
+//     content (a Telegram list item's accessible name is the whole message,
+//     ~900 chars, echoed down every descendant). This consumer never navigates
+//     by path; it targets name + role + occurrence.
+//   - REPEATED SIBLINGS COLLAPSE. A file manager's hundred rows are one *kind*
+//     of thing; the model needs to know a list exists and how long it is, not to
+//     read it. Keep the first few of each (path, role) group and replace the rest
+//     with a count.
+//
+// This is not tuning: WITHOUT the last two, a live Nautilus put its "Show Sidebar"
+// button — correctly named, action `click` — at node 157 of 175, byte 55,313 of
+// 60,367, i.e. PAST the cap. The model was asked to toggle the sidebar, never saw
+// the button, and guessed. Measured after: Nautilus 102 KB → 27 KB (the whole
+// window now fits in one answer), Telegram 503 KB → 34 KB.
+//
+// MCP clients keep the raw tree: they have the context for it and pay once per
+// call, where this one pays on every step of the turn.
+const A11Y_PATH_LINKS = 2
+const A11Y_LINK_CHARS = 48
+const A11Y_SIBLINGS = 3
+// A window's controls are the point of the tool, so this cap is higher than the
+// generic one — sized from measurement (a leaned Nautilus is 27 KB) so a normal
+// window arrives WHOLE rather than cut at its header bar.
+const MAX_A11Y_RESULT = 32000
+// A filtered query that came back with little is ONE STEP from the expensive
+// fallback, and the model cannot see the price it is about to pay. Measured in a
+// live run 2026-07-29: `match:"search"` on a Spanish Telegram matched 4 nodes,
+// none of them the button; the model then asked for the whole window, history
+// went 3,199 b → 40,845 b, and every one of the six remaining steps carried it —
+// ~78k of the turn's 125k input tokens, spent to learn that the control is called
+// "Buscar mensajes". The labels themselves cost 697 bytes (measured, same window).
+// So below this many hits the result carries the on-screen labels AND the size of
+// the dump it is about to ask for. Same filter as nidara-click/nidara-act's
+// `showing` — a name is not a label (in a chat app it is the whole message).
+const A11Y_SHOWING_HITS = 8
+const A11Y_SHOWING_MAX = 40
+// `match` accepts alternation: "a|b" keeps a node matching EITHER. Not a
+// convenience — the model reached for it unprompted and got five empty results in
+// one session (live, 2026-07-29: `match:"cs.svg|Trash"`, count 0 every time, then
+// it fell back to dumping the window twice). It was also right to want it: the two
+// ends of a drag are two names, and asking for both in one call is the correct
+// economy. A literal "|" in an accessible name loses, which is a trade worth making.
+const A11Y_MATCH_OR = "|"
+// States every node carries; they say nothing about which control to pick.
+const A11Y_NOISE_STATES = new Set([
+    "sensitive", "showing", "visible", "enabled", "focusable", "selectable", "opaque",
+])
+
+// Roles that name something you can ACT on, as opposed to something you can read.
+// The distinction is the whole value of the list below: taking labels in document
+// order repeats the mistake the projection already fixes for nodes — content comes
+// first and chrome last, so a positional cut keeps the reading and loses the doing.
+// Measured on a live Telegram window: document order spends 18 of its first 19
+// slots on table cells (Remitente, Mensaje, Entrega…), while filtering by role
+// yields 16 names that are ALL controls, with the one the model was hunting
+// ("Buscar mensajes") second. Roles observed across GTK and Qt.
+const A11Y_CONTROL_ROLES = new Set([
+    "push button", "button", "toggle button", "menu item", "check menu item",
+    "radio menu item", "menu", "page tab", "check box", "radio button", "combo box",
+    "text", "entry", "password text", "link", "spin button", "slider", "list item",
+])
+
+// The short, single-line accessible names on screen, deduped and capped, CONTROLS
+// FIRST. Free: these nodes are already in hand. `A11Y_LINK_CHARS` doubles as the
+// label ceiling — the same 48 the helpers use, and for the same reason (a name is
+// not a label; in a chat app it is the entire message).
+function labelsOf(nodes) {
+    const labelish = n => {
+        const nm = typeof n?.id === "string" ? n.id : ""
+        return nm && nm.length <= A11Y_LINK_CHARS && !nm.includes("\n") ? nm : null
+    }
+    const seen = new Set()
+    for (const n of nodes) {
+        const nm = labelish(n)
+        if (nm && A11Y_CONTROL_ROLES.has(n.role)) seen.add(nm)
+        if (seen.size >= A11Y_SHOWING_MAX) break
+    }
+    // Then fill the remaining slots with everything else that reads like a label.
+    // Controls-first is an ORDERING, not a filter, and the difference is a measured
+    // one: in a chat window the content is noise, but in a FILE MANAGER the content
+    // is the target — Nautilus draws file items as `table cell`/`table row`, so a
+    // role-only list offered "Open Trash" and not the file to drag onto it, and the
+    // model paid a 21 KB whole-window dump for the other half (live, 2026-07-29).
+    // Filling costs little: Nautilus 406 → 729 b, Telegram 401 → 743 b, both still
+    // ~50× cheaper than the dump they exist to prevent.
+    for (const n of nodes) {
+        const nm = labelish(n)
+        if (nm) seen.add(nm)
+        if (seen.size >= A11Y_SHOWING_MAX) break
+    }
+    return [...seen]
+}
+
+function leanA11yNode(n) {
+    if (!n || typeof n !== "object") return n
+    const o = {}
+    if (n.id) o.id = n.id
+    if (n.role) o.role = n.role
+    // `type` is the same string as `role` in every node observed; keep it only if
+    // some toolkit ever disagrees, so nothing is silently lost.
+    if (n.type && n.type !== n.role) o.type = n.type
+    if (n.text) o.text = n.text
+    if (Array.isArray(n.actions) && n.actions.length) o.actions = n.actions
+    if (Array.isArray(n.shortcuts) && n.shortcuts.length) o.shortcuts = n.shortcuts
+    const states = (n.states || []).filter(s => !A11Y_NOISE_STATES.has(s))
+    if (states.length) o.states = states
+    if (n.bounds) o.bounds = n.bounds
+    if (typeof n.path === "string") {
+        let links = n.path.split(" > ")
+            .map(l => (l.length > A11Y_LINK_CHARS ? l.slice(0, A11Y_LINK_CHARS) + "…" : l))
+        if (links.length > A11Y_PATH_LINKS) links = ["…", ...links.slice(-A11Y_PATH_LINKS)]
+        o.path = links.join(" > ")
+    }
+    return o
+}
+
+// Keep the first A11Y_SIBLINGS of each (path, role) run and replace the rest with
+// one entry carrying the count. Document order is preserved — reordering a tree
+// would cost the model the one thing the flat list still encodes, which is where
+// things sit relative to each other.
+function collapseA11ySiblings(nodes) {
+    const groups = new Map()
+    for (const n of nodes) {
+        const k = JSON.stringify([n.path ?? "", n.role ?? ""])
+        groups.set(k, (groups.get(k) || 0) + 1)
+    }
+    const out = [], emitted = new Map()
+    for (const n of nodes) {
+        const k = JSON.stringify([n.path ?? "", n.role ?? ""])
+        const size = groups.get(k)
+        if (size <= A11Y_SIBLINGS) { out.push(n); continue }
+        const seen = emitted.get(k) || 0
+        if (seen < A11Y_SIBLINGS) { out.push(n); emitted.set(k, seen + 1); continue }
+        if (seen === A11Y_SIBLINGS) {
+            emitted.set(k, seen + 1)
+            out.push({
+                role: n.role, path: n.path, omitted: size - A11Y_SIBLINGS,
+                note: "more of the same kind here — use `match` to reach a specific one",
+            })
+        }
+    }
+    return out
+}
+
+function queryAppTool(app, match) {
+    const r = helperResult("nidara-a11y", app ? [app] : [])
+    if (!r.ok) return r
+    let data
+    try {
+        data = JSON.parse(r.content)
+    } catch {
+        return capResult(r)     // not the shape we know — hand it over untouched
+    }
+    if (!Array.isArray(data.nodes)) return capResult(r)
+
+    const total = data.nodes.length
+    const needle = String(match ?? "").trim().toLowerCase()
+    let nodes = data.nodes
+    const needles = needle ? needle.split(A11Y_MATCH_OR).map(s => s.trim()).filter(Boolean) : []
+    if (needles.length)
+        nodes = nodes.filter(n => [n.id, n.text, n.role, n.type].some(
+            v => typeof v === "string" && needles.some(w => v.toLowerCase().includes(w))))
+
+    // The window title lives on every node and is the same string on all of them
+    // whenever one window matched — hoist it rather than pay for 175 copies.
+    const windows = [...new Set(nodes.map(n => n.window).filter(Boolean))]
+    let lean = nodes.map(leanA11yNode)
+    const beforeCollapse = lean.length
+    lean = collapseA11ySiblings(lean)
+
+    // Built fresh, with the ORIENTATION FIELDS FIRST: what this is, how much of it
+    // there is, and what to do next. Appending that after 30 KB of nodes puts the
+    // one actionable sentence behind everything else in the result.
+    const out = {
+        source: data.source,
+        app: data.app ?? app ?? null,
+        ...(windows.length === 1 ? { window: windows[0] } : {}),
+        ...(needles.length ? { match, scanned: total } : {}),
+        count: lean.length,
+        ...(beforeCollapse !== lean.length ? { of_nodes: beforeCollapse } : {}),
+    }
+    // Below the threshold the next move is almost always the whole-window dump, so
+    // answer it here: the labels that ARE on screen (which is where the local
+    // language lives), and what the dump would cost. Computed only on this path —
+    // a filtered query that found what it wanted must not pay for either.
+    const showing = needles.length && lean.length <= A11Y_SHOWING_HITS ? labelsOf(data.nodes) : null
+    if (showing) {
+        const kb = Math.round(
+            JSON.stringify(collapseA11ySiblings(data.nodes.map(leanA11yNode))).length / 1024)
+        const priced = `Calling again without \`match\` returns the WHOLE window (~${kb} KB here), `
+            + "and it then rides on every later step of this turn — try another word first."
+        out.hint = nodes.length
+            ? `only ${nodes.length} of ${total} nodes matched "${match}". If none is the control you want, `
+                + "`showing` lists the labels actually on screen — the control is often named in the user's "
+                + `own language, not English. Pick one VERBATIM. ${priced}`
+            : `no node matched "${match}" among ${total} nodes in this window — it was NOT empty. `
+                + "`showing` lists the labels actually on screen (the control is probably named in the "
+                + `user's own language); pick one VERBATIM, or filter by a role like "button". ${priced}`
+    } else if (data.hint) out.hint = data.hint
+    if (showing) out.showing = showing
+    if (data.apps) out.apps = data.apps
+    out.nodes = lean
+
+    const content = JSON.stringify(out)
+    if (content.length <= MAX_A11Y_RESULT) return { ok: true, content }
+    return {
+        ok: true,
+        content: content.slice(0, MAX_A11Y_RESULT)
+            + `\n… cut here: this window is too big for one answer. Call query_app again with \`match\` set to what you are `
+            + "after (a control's name, or a role like \"button\") — do not re-run this unchanged.",
+    }
+}
+
+// Agent-friendly direction + notch count → the signed (dx, dy) wheel notches the
+// injector expects (dy>0 = down, dx>0 = right). Same mapping as nidara-mcp's.
+function scrollDeltas(direction, amount) {
+    const n = Number.isInteger(amount) && amount > 0 ? amount : 3
+    switch (direction) {
+        case "up":    return [0, -n]
+        case "left":  return [-n, 0]
+        case "right": return [n, 0]
+        default:      return [0, n]   // "down"
+    }
+}
+
+// Optional positional tail for the *-app modes: [role] [occurrence]. A later
+// argument forces the earlier one to be present, so an omitted role is padded
+// with "" rather than skipped — dropping it would shift the occurrence into the
+// role slot and filter by a role called "2".
+function nodeTail(role, occurrence) {
+    const tail = []
+    if (role || occurrence != null) tail.push(String(role || ""))
+    if (occurrence != null) tail.push(String(occurrence))
+    return tail
+}
+
+const num = (v) => (typeof v === "number" ? v : parseInt(String(v ?? ""), 10))
+const missingXY = (i) => !Number.isFinite(num(i?.x)) || !Number.isFinite(num(i?.y))
+
 function execTool(tu) {
     try {
         let out
@@ -876,6 +1437,106 @@ function execTool(tu) {
             }
             case "load_skill":
                 return capResult(loadSkillTool(tu.input?.name))
+            // ── Computer-use ────────────────────────────────────────────────
+            // The gate is re-read per call even though buildToolset only offers
+            // these while it is on: a turn can outlive the switch (the user can
+            // revoke mid-conversation, and the kill switch exists to be used).
+            // Defence in depth only — the helper enforces it again, and it is
+            // the helper's check that can still catch a revocation that lands
+            // while the cursor animation is playing.
+            case "query_app": {
+                if (!computerGate().see) return { ok: false, content: GATE_SEE_OFF }
+                return queryAppTool(String(tu.input?.app ?? "").trim(), tu.input?.match)
+            }
+            case "do_app_action": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.node || !i.action)
+                    return { ok: false, content: "do_app_action needs app, node and action." }
+                return capResult(helperResult("nidara-act",
+                    [String(i.app), String(i.node), String(i.action), ...nodeTail(i.role, i.occurrence)]))
+            }
+            case "type_text": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || i.text == null || i.text === "")
+                    return { ok: false, content: "type_text needs app and text." }
+                return capResult(helperResult("nidara-type", ["text", String(i.app), String(i.text)]))
+            }
+            case "press_key": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.key) return { ok: false, content: "press_key needs app and key." }
+                return capResult(helperResult("nidara-type", ["key", String(i.app), String(i.key)]))
+            }
+            case "click_app":
+            case "hover_app": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.node) return { ok: false, content: `${tu.name} needs app and node.` }
+                const mode = tu.name === "hover_app" ? "hover-app"
+                    : i.button === "right" ? "rclick-app" : "app"
+                return capResult(helperResult("nidara-click",
+                    [mode, String(i.app), String(i.node), ...nodeTail(i.role, i.occurrence)]))
+            }
+            case "click_at":
+            case "hover_at": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || missingXY(i)) return { ok: false, content: `${tu.name} needs app, x and y.` }
+                const mode = tu.name === "hover_at" ? "hover-at"
+                    : i.button === "right" ? "rclick-at" : "at"
+                return capResult(helperResult("nidara-click",
+                    [mode, String(i.app), String(num(i.x)), String(num(i.y))]))
+            }
+            case "scroll_app": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.node || !i.direction)
+                    return { ok: false, content: "scroll_app needs app, node and direction." }
+                const [dx, dy] = scrollDeltas(i.direction, i.amount)
+                return capResult(helperResult("nidara-click",
+                    ["scroll-app", String(i.app), String(i.node), String(dx), String(dy),
+                        ...nodeTail(i.role, i.occurrence)]))
+            }
+            case "scroll_at": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || missingXY(i) || !i.direction)
+                    return { ok: false, content: "scroll_at needs app, x, y and direction." }
+                const [dx, dy] = scrollDeltas(i.direction, i.amount)
+                return capResult(helperResult("nidara-click",
+                    ["scroll-at", String(i.app), String(num(i.x)), String(num(i.y)), String(dx), String(dy)]))
+            }
+            case "drag_app": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                if (!i.app || !i.from_node || !i.to_node)
+                    return { ok: false, content: "drag_app needs app, from_node and to_node." }
+                // Four optional slots, [from-role] [from-occ] [to-role] [to-occ]:
+                // pad up to the LAST one that was supplied, then stop — same
+                // reason as nodeTail, doubled.
+                const tail = [
+                    i.from_role || "",
+                    i.from_occurrence != null ? String(i.from_occurrence) : "",
+                    i.to_role || "",
+                    i.to_occurrence != null ? String(i.to_occurrence) : "",
+                ]
+                let last = -1
+                tail.forEach((v, n) => { if (v !== "") last = n })
+                return capResult(helperResult("nidara-click",
+                    ["drag-app", String(i.app), String(i.from_node), String(i.to_node),
+                        ...(last >= 0 ? tail.slice(0, last + 1) : [])]))
+            }
+            case "drag_at": {
+                if (!computerGate().act) return { ok: false, content: GATE_ACT_OFF }
+                const i = tu.input || {}
+                const pts = [i.from_x, i.from_y, i.to_x, i.to_y].map(num)
+                if (!i.app || pts.some(v => !Number.isFinite(v)))
+                    return { ok: false, content: "drag_at needs app, from_x, from_y, to_x and to_y." }
+                return capResult(helperResult("nidara-click",
+                    ["drag-at", String(i.app), ...pts.map(String)]))
+            }
             case "write_file": {
                 const gate = fileGate("write")
                 if (gate) return { ok: false, content: gate }
@@ -884,13 +1545,31 @@ function execTool(tu) {
                 if (tu.input?.content == null) return { ok: false, content: "write_file needs `content`." }
                 return capResult(writeFileTool(r.path, String(tu.input.content)))
             }
-            default:
+            default: {
                 // The model named a tool that isn't offered. Name the real ones so
                 // the correction is actionable instead of a dead end.
+                //
+                // The common case is not a hallucination at all: run_action's
+                // description lists every ACTION by name (list_apps, focus_window,
+                // setIsland…), and the model calls one of those as if it were a tool.
+                // Measured 2026-07-28 with `list_apps`. Saying "no such tool" to a
+                // name that plainly exists in the prompt is the least useful possible
+                // answer, so check the action index and route it.
+                const ts = buildToolset()
+                const asAction = ts.actionMap[tu.name] ? tu.name
+                    : ts.actionMap[toSnake(tu.name)] ? toSnake(tu.name) : null
+                if (asAction) return {
+                    ok: false,
+                    content: `"${tu.name}" is an ACTION, not a tool — those are not called directly. `
+                        + `Retry as: run_action with action="${asAction}"`
+                        + (tu.input && Object.keys(tu.input).length
+                            ? ` and its positional values in \`args\` (you passed ${JSON.stringify(tu.input)}).` : "."),
+                }
                 return {
                     ok: false,
-                    content: `There is no tool called "${tu.name}". Available tools: ${buildToolset().defs.map(d => d.name).join(", ")}.`,
+                    content: `There is no tool called "${tu.name}". Available tools: ${ts.defs.map(d => d.name).join(", ")}.`,
                 }
+            }
         }
         // Same lossless squeeze as the system prompt, and it matters MORE here:
         // a tool result is appended to `history` and re-sent on every later
@@ -933,11 +1612,47 @@ const HIDDEN_ACTIONS = new Set([
 function buildSystemPrompt() {
     if (systemCache) return systemCache
     const lang = GLib.getenv("LANG") || "en"
+    // Rules that span the whole computer-use toolset live HERE, once, instead of
+    // in eleven tool descriptions — the same trade the action index makes. They
+    // appear only while the gate that grants them is on, so a desktop with both
+    // off carries none of this text.
+    const gate = computerGate()
+    const beyondNidara = []
+    if (gate.see) beyondNidara.push(
+        "- You can also look inside OTHER applications with query_app, which reads that window's accessibility tree. It is your only view of another app — you cannot see the screen. Describe what the tree reports, never what you imagine the app looks like, and say plainly when it reports nothing.",
+        // The one trap perception opens: `screenshot` is in the action index and
+        // sounds like eyes. It saves a PNG and hands back a path — the picture
+        // never reaches this conversation, and a model that forgets that starts
+        // describing a screen it has not seen.
+        "- run_action screenshot saves a picture and returns its FILE PATH. You never see the image itself, so take one only when the USER wants the file, and never describe its contents.",
+    )
+    if (gate.act) beyondNidara.push(
+        "- You can act on other applications. In order of preference: do_app_action (deterministic, no synthetic input) first, then press_key/type_text on a focused control, then click_app/hover_app, and the coordinate forms (click_at/hover_at/scroll_at/drag_at) LAST — only with numbers taken from a query_app node's bounds, never guessed.",
+        "- All of those act on the FOCUSED window and refuse otherwise: call run_action focus_window first. Afterwards re-read with query_app before you tell the user it worked. The user can revoke this at any moment and moving their mouse cancels an action in flight — if that happens, say so, don't retry silently.",
+        // The user watching cannot see through your own panel. Reported by them
+        // 2026-07-28 as a design fault, and they are right: acting under your own UI
+        // is indistinguishable from acting behind their back.
+        "- YOU ARE DRAWN ON THIS SCREEN. The Assistant sits in the Activity Island, which covers part of the display; dump_state reports the rect as overlays.islandBounds, and a click that lands inside it comes back with a `warning`. When you must act in that area, call run_action setIsland closed first, do the work so the user can watch it, then run_action setIsland agent to come back. Closing it does not end your turn or lose this conversation.",
+        // Measured 2026-07-29 with the panel open on screen: the pointer never
+        // moves back, so a hover holds — until the island's full-screen dismissal
+        // region returns and the app under the cursor gets a pointer LEAVE.
+        "- HOVER IS THE SHARP CASE OF THAT. What a hover reveals dies the instant your panel comes back, because the island takes the pointer. So close it BEFORE hovering, not after: setIsland closed → hover_app → query_app → setIsland agent.",
+    )
     systemCache = [
         "You are Assistant, the built-in helper for the Nidara desktop (a Wayland desktop environment for Arch Linux, compositor Hyprland).",
         "You help the user operate their desktop with natural language by calling tools.",
         // Rich enough to ANSWER from — see the "describing yourself" rule below.
-        "What you can do: open/close shell surfaces (control center, notifications, search, app grid, overview, settings); manage windows and workspaces; launch apps; change settings (appearance, accent, dark mode, dock, notifications, night light, gaming); read desktop state; read the desktop's own configuration files, its shipped defaults and the shell log.",
+        // This summary is LOAD-BEARING, not flavour: the rule below tells the model
+        // to answer "what can you do?" from it without calling a tool. So anything
+        // missing here the model will actively DENY. Measured 2026-07-28: with both
+        // computer-use gates ON, asked to add a timer, it answered "no puedo — mis
+        // funciones me permiten controlar ajustes, abrir aplicaciones o administrar
+        // ventanas" — a near-verbatim recital of this line, which said nothing about
+        // driving other apps. It took the user insisting twice to get it to try.
+        // Hence the gated tail: the sentence has to grow when the capability does.
+        "What you can do: open/close shell surfaces (control center, notifications, search, app grid, overview, settings); manage windows and workspaces; launch apps; change settings (appearance, accent, dark mode, dock, notifications, night light, gaming); read desktop state; read the desktop's own configuration files, its shipped defaults and the shell log."
+            + (gate.see ? " You can also READ what is on screen inside other applications." : "")
+            + (gate.act ? " And you can OPERATE other applications — press their buttons, set their values, type into them — so a request the desktop itself cannot serve (\"set a 7-minute timer\") is usually done by launching the right app and driving its interface. Do that rather than saying you cannot." : ""),
         "Rules:",
         "- Be concise: you answer in a small chat panel.",
         "- The user is in charge. Do only what they ask; ask first before anything destructive or irreversible.",
@@ -966,6 +1681,7 @@ function buildSystemPrompt() {
         // progressive disclosure actually happen — a skill nobody loads is a file.
         "- Before your FIRST file change in a conversation, call load_skill on the skill that matches (for desktop customization that is `customize`). It carries rules you cannot infer from the file itself.",
         "- Routing a change: a SETTING goes through set_config. A keybind, window rule or startup program goes in ~/.config/nidara/hyprland-user.lua (read it, then edit_file) — then call run_action reload_hyprland to apply it. Never edit a settings JSON directly; the shell owns those and would overwrite you.",
+        ...beyondNidara,
         // The language of the MESSAGE wins, always. The desktop locale is a hint
         // for the ambiguous case, never the rule: people routinely run an English
         // desktop and talk to it in their own language, and switching languages
@@ -1403,9 +2119,31 @@ function makeGeminiHandler() {
                         const slot = slots.get(data.index)
                         if (slot) slot.argParts.push(typeof d.arguments === "string" ? d.arguments : JSON.stringify(d.arguments))
                     }
-                    // The reasoning signature for a TEXT reply rides on its own
-                    // `thought` step's delta (function calls carry it on the call).
-                    else if (d.type === "thought_signature" && d.signature) thoughtSig = d.signature
+                    // THE reasoning signature. Echoing it back is not optional: a
+                    // history containing a `function_call` with no signature anywhere
+                    // is rejected outright with a bare "Request contains an invalid
+                    // argument", which names no field and points nowhere.
+                    //
+                    // It arrives as a BARE `{signature}` delta with NO `type` — this
+                    // used to test `d.type === "thought_signature"`, a shape the API
+                    // never sends, so the signature was never captured on any Gemini
+                    // turn (that is what `sig=0/1` in the step log meant, logged for
+                    // weeks and read as a curiosity). Measured against the live
+                    // stream 2026-07-28:
+                    //
+                    //   step.start {"index":0,"step":{"type":"thought"}}
+                    //   step.delta {"index":0,"delta":{"signature":"CiQBEU0y…"}}
+                    //   step.start {"index":1,"step":{"type":"function_call",…}}   ← no signature here
+                    //
+                    // So it belongs to the THOUGHT step, not the call, and it is
+                    // routed by index: a signature on a function_call slot rides on
+                    // that call, anything else is the turn's thought signature.
+                    // Both placements were verified accepted; only "neither" fails.
+                    else if (d.signature) {
+                        const slot = slots.get(data.index)
+                        if (slot) slot.signature = d.signature
+                        else thoughtSig = d.signature
+                    }
                     break
                 }
                 case "interaction.completed": {
@@ -1742,7 +2480,17 @@ async function streamCurl(req, onLine) {
     const exitCode = proc.get_exit_status()
     const ok = proc.get_successful()
     currentCurl = null
-    if (!ok) log(`curl failed: exit=${exitCode} http=${httpCode || "net"}${retryAfter ? ` retry-after=${retryAfter}s` : ""} ${err ? `stderr="${truncate(err, 200)}"` : `body=${raw.length}b`}`)
+    // On an HTTP error the PROVIDER's explanation is in the body — that is the whole
+    // point of --fail-with-body — while curl's stderr says only "returned error: 400".
+    // Logging the stderr and dropping the body left a 400 as an unexplained event
+    // (2026-07-28: a turn died and the reason had to be inferred from request sizes).
+    // Body first whenever we got one, and only fall back to stderr for curl's OWN
+    // failures (DNS/TLS/timeout), where there is no body and stderr is all there is.
+    if (!ok) {
+        const detail = raw.trim() ? `body="${truncate(raw.trim().replace(/\s+/g, " "), 400)}"`
+            : err ? `stderr="${truncate(err, 200)}"` : "no body"
+        log(`curl failed: exit=${exitCode} http=${httpCode || "net"}${retryAfter ? ` retry-after=${retryAfter}s` : ""} ${detail}`)
+    }
     return { ok, raw, err, httpCode, exitCode, retryAfter }
 }
 
@@ -1829,6 +2577,14 @@ async function runTurn(userText) {
         // it is the current turn (kept full); everything before is prior turns
         // (tool results stubbed).
         turnStartIndex = history.length - 1
+        // The computer-use gates decide which tools exist and which rules the
+        // prompt carries, and BOTH are cached per session — so a user who grants
+        // permission mid-conversation would otherwise keep talking to an assistant
+        // that was never told. Checked at the turn boundary only: rebuilding
+        // mid-turn would change the tool list between two steps of one request
+        // chain, which is how a provider ends up with a tool_result for a tool it
+        // was not offered.
+        syncComputerGate()
         const system = buildSystemPrompt()
         emit({ t: "state", s: "thinking" })
         log(`turn start: provider=${cfg.brainProvider || "?"} backend=${backend} model=${cfg.brainModel || "(default)"} chars=${userText.length} history=${history.length}`)
@@ -1908,16 +2664,23 @@ async function runTurn(userText) {
             // Keep both: the two disagreeing is exactly how Google's compat path
             // was caught dropping tool calls.
             // sig= counts per-call opaque extras captured (Gemini's thought
-            // signature): sig=0/1 on a Gemini turn means the stream didn't carry
-            // it and the echo can't work — worth knowing without guessing.
+            // signature). READ IT WITH tsig=: the signature legitimately arrives in
+            // EITHER place, and on the live Interactions stream it is normally the
+            // thought step (index 0) rather than the function_call, so a healthy
+            // Gemini turn reads `sig=0/1 tsig=y` — that was misread as a defect for
+            // weeks. The real defect is NEITHER, which 400s the next request, and it
+            // gets its own line below instead of a counter to interpret.
             const sigs = r.toolUses.filter(tu => tu.extra).length
+            const tsigNote = r.thoughtSig === undefined ? "" : ` tsig=${r.thoughtSig ? "y" : "n"}`
+            if (r.toolUses.length && !sigs && r.thoughtSig !== undefined && !r.thoughtSig)
+                log(`step ${step}: NO reasoning signature anywhere (neither on the ${r.toolUses.length} call(s) nor a thought step) — the next request will be rejected as "invalid argument". The stream shape changed; see tech-debt #38 (i).`)
             // cached= is the share of the input served from the provider's cache.
             // A session where it stays 0 after the first request means the fixed
             // prompt is being billed in full every single time.
             const cacheNote = r.usage.cached || r.usage.cacheWrite
                 ? ` cached=${r.usage.cached}${r.usage.cacheWrite ? `+w${r.usage.cacheWrite}` : ""}`
                 : ""
-            log(`step ${step}: ok=${ok} text=${r.text.length}c tools=${r.toolUses.length}${r.toolUses.length ? ` sig=${sigs}/${r.toolUses.length}` : ""} stop=${r.stopReason || "?"} finish=${r.finishReason || "?"} tok=${r.usage.input}/${r.usage.output}${r.usage.thought ? ` think=${r.usage.thought}` : ""}${cacheNote}`)
+            log(`step ${step}: ok=${ok} text=${r.text.length}c tools=${r.toolUses.length}${r.toolUses.length ? ` sig=${sigs}/${r.toolUses.length}${tsigNote}` : ""} stop=${r.stopReason || "?"} finish=${r.finishReason || "?"} tok=${r.usage.input}/${r.usage.output}${r.usage.thought ? ` think=${r.usage.thought}` : ""}${cacheNote}`)
             // Count BEFORE any early return: a turn that fails still cost money,
             // and the failures are the expensive ones (a 25k-token turn that
             // ended at the step cap reported ZERO usage — user-caught 07-21).

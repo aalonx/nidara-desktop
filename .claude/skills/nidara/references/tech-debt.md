@@ -718,20 +718,284 @@ path for POSITIONING rather than replace it for buttons.
 **Order matters, and it is not what it looks like:** doing the Assistant's
 computer-use parity FIRST would duplicate (a), (b) and (d) into a fourth consumer
 and cement the drag asymmetry in one more place. Fix the surface, then mirror it.
-With (a) and (b) landed, the surface a parity pass would mirror is now
-**symmetric** — five verbs, each with an `-app` and an `-at` form. (d) is still
-open and still duplicates into whatever consumes it, which is the remaining
-argument for keeping the Assistant's parity last.
+**Done in that order** — (a) and (b) landed in #62, and the Assistant mirrored the
+*fixed* surface afterwards (2026-07-27): same names, same parameters, hover and
+`drag_app` included from the start rather than bolted on later. (c) and (d) are
+still open and now have TWO consumers to land in, which is the argument for doing
+(d) in the wrapper rather than in either caller.
+The surface both consumers now mirror is **symmetric** — five verbs, each with an
+`-app` and an `-at` form.
 
-**Found while verifying (a) live, and it bears on the parity decision:** a GTK
-tooltip is **not an accessibility node**. Hovering Nautilus's Back button rendered
-the tooltip in a screenshot while the AT-SPI tree held zero tooltip-role nodes
-before and after. So hover reveals state that a client WITHOUT VISION still cannot
-read — the MCP descriptions now say to use `screenshot` for tooltip text. For the
-built-in Assistant (no vision today) that makes hover useful for *provoking* UI —
-opening hover menus, revealing controls, which are ordinary accessibles — but not
-for reading tooltips. Weigh that when scoping its parity, and do not "fix" the
-absence of tooltip nodes: it is GTK's, not ours.
+**(e) ~~Every pointer/keyboard verb was structurally dead from inside the
+Assistant.~~ FIXED 2026-07-27, and it is the reason the first live trial read as
+"it can't do anything".** Not a fifth gap in the verb surface: a compositor
+constraint nobody had connected to computer-use. `CFocusState::rawWindowFocus`
+returns early while any layer surface holds an EXCLUSIVE keyboard grab — which the
+Assistant island does the whole time the user is typing at it — so `focus_window`
+was a no-op, the helpers' focus check then correctly refused, and the click would
+have been swallowed anyway (Hyprland routes the pointer to a grabbing surface
+regardless of its input region, and the island spans the monitor). AT-SPI
+perception and `do_app_action` were unaffected, which is what made it look like
+model clumsiness. Fixed with `core/InputYield` + the `yieldInput` IPC (the helpers
+ask the shell to let go for the length of one verb); `focusWindow` now verifies
+instead of reporting a refused focus as success. Full reasoning in
+`state-and-ipc.md` → "The shell has to STEP OUT OF THE WAY for computer-use".
+**The mis-diagnosis is worth remembering:** the first reading was "`hyprctl
+activewindow` lies while a grab is held", and the obvious fix — source focus from
+`listWindows.focused` instead — would have made the helper approve an action that
+cannot land, and typed the agent's text into its own prompt box. The compositor's
+source code settled it in one grep.
+
+**(f) ~~A successful action reported FAILURE — `pingShell` polluted stdout.~~
+FIXED 2026-07-28, found in the first live run after (e).** `nidara-type` and
+`nidara-act` pinged the AI-control indicator with
+`GLib.spawn_command_line_async("ags request notifyComputerAction")`, which **cannot
+redirect stdio**, so the child inherited ours and the `ags` CLI's reply (`ok`)
+landed on the helper's stdout right after its JSON. The daemon parses exactly one
+JSON per helper, so it failed → the tool came back `ok:false`. **Deterministic, not
+racy:** the daemon reads to EOF, and the pipe's write end stays open until the ping
+child exits, so the `ok` is always waited for. Worst in `nidara-act`, which pings
+only when the action **succeeded** — so the tool reported failure precisely when it
+had worked. `nidara-click` already had the fix (Gio + `STDOUT_SILENCE`) and the
+comment explaining it; the other two never got it. It stayed invisible because the
+focus gate refused every Assistant call before reaching the ping. **Rule for any new
+helper: nothing but the one JSON may reach stdout — fire-and-forget children must be
+`Gio.Subprocess` with `STDOUT_SILENCE`, never `spawn_command_line_async`.**
+
+**(m) `scroll` and `drag` verified live at last — and the friction was `match`.
+Fixed 2026-07-29.** The sixth run dragged `cs.svg. File` onto `Open Trash` in
+Nautilus and scrolled it four times, every call `ok:true`. That closes the live gap:
+**all five pointer verbs** (click / hover / scroll / drag / type) have now been
+driven against a real window. The waste was elsewhere, again, and again in what we
+tell the model:
+
+- **The model wrote `match:"cs.svg|Trash"` and got `count: 0` five times.** `match`
+  was a plain `includes()`, so `|` meant a literal pipe. It was **right to want it**:
+  the two ends of a drag are two names and asking for both in one call is the
+  correct economy. `match` now splits on `|` and keeps a node matching EITHER. A
+  literal pipe in an accessible name loses — a trade worth making.
+- **`showing` had half the answer and the model still dumped the window.** Measured
+  against the live Nautilus tree: the list it would have returned contains
+  **"Open Trash"** in 406 b — the very label the model paid a 21 KB whole-window
+  dump to learn. What it did NOT contain was the file: Nautilus draws items as
+  `table cell`/`table row`, which the control-role pass excludes. **In a chat window
+  the content is noise; in a file manager the content is the target.** So
+  controls-first is now strictly an ORDERING, with the remaining slots filled from
+  everything else labelish: Nautilus 406 → 729 b, Telegram 401 → 743 b, both still
+  ~50× cheaper than the dump they exist to prevent. Pinned: scenario 4 asserts the
+  first label is the control AND that content fills the rest (both verified failing).
+
+**(l) A hover DOES hold — until our own island takes the pointer back. Measured
+2026-07-29, do not re-derive.** The user hovered Telegram's emoji button through
+the agent, watched the panel open, and then watched it close on its own. Three
+facts, all measured live, and they decide a design question that was about to be
+answered wrongly:
+
+1. **The pointer never moves back.** `hyprctl cursorpos` reported the hover target
+   (1207, 1308) still, seconds after `nidara-click` had exited. With the island
+   CLOSED the panel stayed open indefinitely — user-confirmed on screen.
+2. **Opening the island closes it.** While a `needsKeyboard` island mode is open,
+   `Bar.tsx` calls `setCatcher(true, 0)`, and `IslandWindow.updateInputRegion`
+   stamps a dismissal rect from y=0 to the full monitor height. `InputYield`
+   empties that region for the action and `Bar.tsx`'s `notify::active` handler
+   re-stamps it at `end()` — so the app under the cursor gets a pointer LEAVE and
+   the popup closes. **A hover is not a state we hold; it is a consequence of which
+   surface owns the pointer.**
+3. **The revealed popup may not exist for AT-SPI at all.** Two independent walks of
+   Telegram's tree with the panel open ON SCREEN: 398 → 401 nodes, the four new
+   ones unrelated churn (a chat item's presence changed), and **one window** in the
+   tree throughout. A Qt popup is drawn without an accessible node, exactly like a
+   GTK tooltip.
+
+**Fact 3 is why the obvious fix was NOT built.** The plan was to have `hover_app`
+read the tree inside the truce, before `end()` closes the popup — an atomic "hover
+and look". It would have returned nothing here, because there is nothing to return.
+Measuring first is the only reason that code does not exist. The sticky-yield
+variant (hold the truce open across a hover) dies on the same fact and costs a
+click-through shell for up to the 15 s watchdog.
+
+What shipped instead is the sequence that already works, taught where the decision
+is made: **`setIsland closed` → `hover_app` → `query_app` → `setIsland agent`**, in
+the gated prompt block, plus honest descriptions on both consumers (a hover holds;
+what it reveals may be unreadable — say so rather than guess). No CI pin: the
+constraint lives in the compositor's pointer-focus rules, and a string assertion on
+prose would be theatre.
+
+**(k) The fourth live run cost 62 % of its tokens on ONE unfiltered `query_app`.
+Fixed 2026-07-29.** The run itself went well — the focus refusal from (j) recovered
+in a single step, exactly as designed. The waste was elsewhere, and only the token
+counts show it: step 1 filtered (`match:"search"`, 4 hits, history 3,199 b), and
+because the UI is in **Spanish** none of the 4 was the button, so step 2 asked for
+the whole window. History went to 40,845 b and **every one of the six remaining
+steps carried it** — ~78k of the turn's 125,483 input tokens, spent to discover
+that the control is called "Buscar mensajes".
+
+**The model cannot see the price of what it is about to ask for.** Worse, the old
+code only hinted on a match of exactly ZERO, and the hint recommended *"call again
+without `match`"* — i.e. it pointed at the 37 KB path without naming its cost. Now
+a filtered query with ≤ 8 hits carries `showing` (the labels on screen) and a hint
+that states the size of the dump it is declining to recommend. Free: those nodes
+are already in hand, and it is computed **only** on that path.
+
+**`showing` is CONTROL-FIRST, and that is the whole point** — taking labels in
+document order repeats the head-cut bug the projection exists to fix, one level up.
+Measured on the live Telegram window: document order spends 18 of its first 19
+slots on table cells (*Remitente, Mensaje, Entrega…*), while filtering by role
+gives **16 names, all controls, 401 bytes, with "Buscar mensajes" second**. Below 8
+control-role names it falls back to every labelish name — an unknown toolkit must
+degrade to a noisy list, never an empty one. Pinned in `agent-loop` scenario 4,
+where the stub's only control sits at node 121 behind 120 rows: with the role pass
+removed the assertion reports `['file-000.txt', …]`. The live measurement is **Qt**
+(Telegram); the GTK side is the stub, built from the measured Nautilus tree, not
+re-measured live.
+
+**(j) The third live run SUCCEEDED — and its two wasted steps were both our own
+text, not the model's judgement. Fixed 2026-07-29.** "Añade un temporizador de 7
+minutos con título Hola Manola": 11 steps, timer created, Clocks tiled with a
+floating window over it. Two tool calls failed on the way, and the transcript names
+the cause of each — read the log, not the vibe.
+
+- **We taught a remedy we had already measured as broken.** Step 4 was
+  `do_app_action Clocks "Hola Manola" SetFocus`, and the model did not invent it:
+  `type_text`'s own description said *"Focus the field first (do_app_action …
+  SetFocus)"*, and `nidara-type`'s focus-gate refusal repeated it — while
+  `nidara-click`'s refusal already said the right thing (`focus_window`), and while
+  entry (h) above records that GTK4 does not implement `Component.GrabFocus`.
+  **Advice drift between sibling helpers, the same class as the double-`ok` bug in
+  (a).** Now all four say the same thing, and the distinction is stated once,
+  everywhere it appears: the WINDOW is focused with `focus_window` (the only verb
+  that can); a CONTROL takes `SetFocus` only where the toolkit exposes it (Qt yes,
+  GTK4 usually not); a NUMBER takes `set-value=N` and no keyboard at all. Pinned
+  **statically** by `agent-loop` scenario 3d — no stub would have caught this, and
+  a live run is not a place to discover our own documentation is wrong.
+- **A refusal that names the remedy but not the target still costs three steps.**
+  `type_text` → refused → `list_windows` → `focus_window` → retry. The helper knew
+  which app was meant, so both `nidara-type` and `nidara-click` now resolve it and
+  hand back `focus: {address, class, title}` — recovery is one call. The lookup runs
+  **only on the refusal path**; the happy path must not pay for a second `hyprctl`.
+- **`nidara-act`'s miss was still a dead end** — the `showing` list from (g) went to
+  `nidara-click` only, and the two helpers are aimed by the SAME name, so a dead end
+  in one is a dead end in both. It answered with a list of *applications*, which is
+  the wrong question answered when the app has already matched. Now: app not found →
+  `apps` (the only case where that list IS the answer); node not found → `showing`,
+  same 40-name / 48-char / single-line filter as `nidara-click`.
+
+Verified live (read-only paths only — no pointer verbs): a node miss on Clocks
+returns 11 real control labels, an unknown app returns the app list, and both
+refusals hand back `0x55c8c9cc6df0` — the exact address the model had spent two
+steps discovering.
+
+**(i) ~~Every Gemini tool turn died on step 2 — the reasoning signature was never
+captured.~~ FIXED 2026-07-28.** Surfaced as "a JSON error from Google"; the log said
+only `curl failed: exit=22 http=400`. Three things had to be fixed to even see it,
+and the order matters if this recurs:
+
+1. **The 400's body was being thrown away.** `--fail-with-body` was already there, so
+   the provider's explanation WAS captured — and the log printed curl's useless
+   `stderr="returned error: 400"` instead. Body first now.
+2. **Root cause, measured against the live API** (three probes, not docs): the
+   Interactions API **rejects a history whose `function_call` carries no signature
+   anywhere**, with a bare `Request contains an invalid argument` that names no field.
+   Verified positively too — a preceding `{type:"thought", signature}` step is
+   accepted, and so is the signature placed on the call; only "neither" fails.
+   The signature arrives as a **bare `{"signature": …}` delta with NO `type` field**:
+
+   ```
+   step.start {"index":0,"step":{"type":"thought"}}
+   step.delta {"index":0,"delta":{"signature":"CiQBEU0y…"}}     ← here, untyped
+   step.start {"index":1,"step":{"type":"function_call",…}}     ← NOT here
+   ```
+
+   The daemon tested `d.type === "thought_signature"`, a shape the API never sends,
+   so it captured nothing and replayed unsigned calls. **`sig=0/1` in the step log
+   was this, and it had been sitting in the log for weeks read as a curiosity.**
+
+   **CORRECTION, 2026-07-29 — do NOT read `sig=` alone.** The first version of this
+   entry said "treat `sig=0/N` on a Gemini turn as a defect, not a quirk", and that
+   is wrong in the direction that wastes time: the signature rides the **thought
+   step**, so `sigs` (which counts signatures on the CALL) is legitimately 0 on a
+   perfectly healthy turn. The next live run — 11 steps, every request 200 —
+   printed `sig=0/1` on all of them. A counter that reads identically whether or
+   not the thing works is not telemetry. The step log now prints **`tsig=y|n`**
+   beside it, and the genuine failure (neither place) gets its own named line:
+   *"NO reasoning signature anywhere … the next request will be rejected"*.
+   Pinned by `agent-loop` **scenario 3c**, whose stub is 3b's stream with the
+   signature delta deleted (with an `assert` that the deletion actually happened,
+   so a no-op replace cannot make it pass for the wrong reason).
+3. **A dead end that made it worse:** the model had called `list_apps` — an ACTION
+   from run_action's index — as if it were a tool, and got "there is no tool called
+   list_apps", which is the least useful possible answer about a name that plainly
+   appears in its prompt. The unknown-tool branch now checks the action index and
+   answers `"list_apps" is an ACTION — retry as run_action with action="list_apps"`.
+
+**Two wrong turns worth remembering, because both looked convincing.** The first
+theory was "Gemini 400s on an undeclared function name in history" — tested against
+`generateContent`, which returned **200**, so it was dropped. The second was "the
+call id must be server-issued" — three id shapes were tried and all failed
+*identically*, which is what pointed at something common to all of them. The
+Interactions API's single generic error message makes bisecting the request the only
+way through; `scripts/ci/agent-loop-test.py` now pins the outcome (scenario 3b,
+verified failing against the old condition before being kept).
+
+**(h) Three failures from the second live run (a 7-minute timer), all fixed
+2026-07-28.** Read the transcript, not the vibe — every one had a mechanical cause.
+
+- **"No puedo."** Twice, with both gates ON, before the user insisted. The model was
+  reciting the system prompt's *"What you can do"* summary, which listed shell
+  surfaces and windows and said nothing about driving other apps — while a rule two
+  lines below tells it to answer that question **from the summary, without calling a
+  tool**. So a capability missing from that sentence is one the model actively
+  DENIES. The summary now grows with the gates. **Anything you add to computer-use
+  has to be added there too, or it does not exist as far as self-description goes.**
+- **7 minutes became 11 h 40 min (= 700 minutes).** GNOME Clocks' "Minutes" node is a
+  `spin button` whose `actions` array is **empty**, so `SetFocus` failed, and the
+  agent typed "7" blind — the digits landed on whatever had focus and concatenated
+  with what was already in the field. Verified against a live GtkSpinButton: the
+  widget reports `value=true component=true`, i.e. the number was always settable
+  directly. `nidara-a11y` now reports a `value` block (current/min/max) for anything
+  carrying the Value interface, and `nidara-act` takes `set-value=<n>`, reading the
+  result BACK so a clamp is reported as `ok:false` with the real value rather than a
+  cheerful lie. No new tool: `do_app_action` already passes `action` through, so this
+  cost zero prompt bytes — only the descriptions changed (daemon + MCP, kept in step).
+- **It clicked controls sitting UNDER its own panel.** The user called this a design
+  fault and had asked for the fix long before: *the agent must know whether the
+  island is open and be able to control it.* The island now reports what it COVERS
+  (`IslandWindow.occupiedRect`, capsule + revealed mode, with the monitor connector
+  so a multi-monitor consumer cannot compare across screens) via
+  `dumpState.overlays.islandBounds`; `yieldInput begin` returns the same rect so
+  `nidara-click` can flag a click that lands inside it **as a warning on a SUCCESSFUL
+  action** — the click does land (the yield makes the surface click-through), it is
+  the invisibility that needs saying. `setIsland <mode|closed>` is the exact-state
+  verb. Resizing/reshaping the island from the agent is explicitly LATER (user).
+
+**NO `focus` VERB — measured, not assumed, so do not add one back.**
+`Atspi.Component.grab_focus` is the obvious companion to `set-value` and it returns
+FALSE on GTK4 even with its own window already focused (checked against a live
+GtkSpinButton with `hyprctl activewindow` naming the probe). GTK4 dropped ATK and its
+AT-SPI backend does not implement `Component.GrabFocus`. A tool that always fails is
+worse than no tool AND costs prompt bytes on every request. Focus a WINDOW with
+`focusWindow`; to put a value somewhere, set the value instead of aiming a keyboard.
+
+**(g) A miss now answers the next question.** `nidara-click`'s "no showing node
+named X" was a dead end, and recovery cost a whole `query_app` round trip (measured:
+2 of 11 calls in that run were guesses — `"page tab"`, a ROLE in the name slot, and
+`"Start"`). It now returns `showing`: the short, single-line names on screen, free
+because `nameOf` is already called for every node on that walk. **The filter is the
+point, not a detail** — an accessible name is not a label (in Telegram it is the
+entire message), so unfiltered this returned ~10 KB and would have cost more than
+the round trip it saves. Live-checked against Telegram: 1157 bytes, 40 real control
+labels.
+
+**Found while verifying (a) live, and it decided how the Assistant's hover reads:**
+a GTK tooltip is **not an accessibility node**. Hovering Nautilus's Back button
+rendered the tooltip in a screenshot while the AT-SPI tree held zero tooltip-role
+nodes before and after. So hover reveals state that a client WITHOUT VISION still
+cannot read — the MCP descriptions say to use `screenshot` for tooltip text, which
+would be useless advice for the Assistant (it gets a path, not an image). Its
+`hover_app` description therefore says the tooltip text is unreachable **and to say
+so to the user**; hover stays useful there for *provoking* UI — opening hover menus,
+revealing controls, which are ordinary accessibles. Do not "fix" the absence of
+tooltip nodes: it is GTK's, not ours.
 
 **Not a gap, recorded to stop it being "fixed" again:** `screenshot` is reachable
 by the built-in Assistant today (it is not in `HIDDEN_ACTIONS`) and returns a PNG
@@ -739,7 +1003,11 @@ path the Assistant cannot see. That is FINE — "take me a screenshot" is a
 legitimate user request the Assistant fulfils without vision. Do not hide it. The
 only adjustment worth making is wording: the MCP description frames screenshots as
 a way for an agent to *verify its own work*, which is true for a client with vision
-and false for the Assistant.
+and false for the Assistant. **Done 2026-07-27**, and in the cheaper place: the
+`listActions` first clause the Assistant actually sees was already neutral, so the
+correction is one line in the gated prompt block — *screenshot returns a file PATH,
+you never see the image, never describe its contents*. It sits behind the
+perception gate because that is when a model starts reaching for eyes.
 
 ### 37. Assistant file layer ("tier 1") — debt created 2026-07-27
 The six daemon-local file tools shipped (see `state-and-ipc.md` for the frontiers and the
