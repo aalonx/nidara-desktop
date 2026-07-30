@@ -995,6 +995,41 @@ here and it is one wrapper mode + one tool in each consumer. Phase 1 — percept
   mode" banner); Chromium/Electron need `--force-renderer-accessibility`; the rest fall back to
   `screenshot` (vision). AT-SPI screen coords are unreliable on Wayland → bounds are
   **window-relative**.
+- **Terminals: the EMULATOR publishes the tree, not the program inside it.** A VTE terminal
+  (`gnome-terminal`) exposes its visible screen as ONE node, `role: "terminal"`, whose `text` is
+  the screen — so an agent can read a TUI, including another coding agent's session. **kitty
+  publishes no tree at all** (absent from the registry, not empty), so there is nothing to read
+  there and no filter will find it. **No scrollback** either way: only the visible grid.
+  Three things about that node that are not guessable and cost real time:
+  - **The cap cuts by the TAIL for grid roles** (`TAIL_FIRST_ROLES`), because a terminal's newest
+    output and its prompt are at the BOTTOM. Head-first truncation is the same
+    positional-truncation failure as the node budget losing Nautilus's header bar: it returns a
+    stale screen and no way to tell. The notice states the loss and names no lever — there is none.
+  - **⚠️ `get_character_count` OVER-REPORTS on VTE** (measured 5535 against a `get_text(0, n)`
+    returning 4925: it counts screen CELLS, the text drops per-line trailing blanks). Usable as
+    the upper bound of a range request and **nothing else** — an offset derived from it lands past
+    the real end and AT-SPI answers with an **EMPTY STRING, not an error**, i.e. `text: null` with
+    a silent stderr. Take a tail by fetching the node whole and slicing in JS.
+  - **Grid text is per-line rstripped** (1402 of 5432 chars on one screen were width padding).
+    Lossless on a grid, so it buys back a quarter of the budget; **not** applied to plain text
+    widgets, where a trailing space can be something someone typed.
+- **The `<app-name>` filter matches AT-SPI NAMES, and an agent's vocabulary is Hyprland CLASSES**
+  (that's what `list_windows` returns). Those are not the same string: `gnome-terminal` has no
+  substring relation to `org.gnome.Terminal`. A strict substring pass runs first (so exact filters
+  keep their meaning), then a **rescue pass through `classMatches`**, which canonicalises BOTH
+  sides — last dot-segment, separators dropped. Keep it symmetric: either side can be the
+  dotted one, and the version that only split `cls` missed this exact case.
+- **A perception result is a SNAPSHOT and the tool has to say so** — measured twice with the
+  same model, which is what rules out model tier. Fresh conversation: it called `query_app` and
+  answered correctly. Same question with an earlier `query_app` in history: **`steps=1 tools=0`**,
+  no call at all, answered from the stale copy while the answer sat on the live screen. Reusing it
+  is *reasonable* — a file read stays true until something writes, and the daemon models exactly
+  that (`readThisSession`, invalidated in `writeFile`). A screen has **no write to hook**: it goes
+  stale on its own, so no mechanism can mark it and the DESCRIPTION carries the rule ("snapshot of
+  one instant, call it again before answering about now"). Kept in parity in `nidara-agent` and
+  `nidara-mcp`. **Any new volatile perception tool needs the same sentence** — and note the shape
+  of the lesson: the truncation notice that named a lever the tool did not have made things worse,
+  so a caveat must always name the lever that works.
 
 Phase 2a — **action, deterministic only (built)**:
 

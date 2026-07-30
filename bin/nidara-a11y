@@ -107,6 +107,17 @@ const INTERACTIVE_ROLES = new Set([
     "table cell", "tree item", "switch",
 ])
 
+const MAX_TEXT = 2000       // per node; a full terminal screen is ~2-6 KB
+
+// Roles where the NEWEST content is at the END of the text, so a head-first cut
+// drops exactly what matters. A terminal emulator exposes its visible screen as
+// one text node: the top is scrolled-away history, the bottom is the last output
+// and the prompt. Cutting the tail there hands the agent a stale screen and no
+// way to tell — the same "positional truncation loses the wrong side" failure as
+// the a11y node budget. There is no lever to page it (AT-SPI exposes no
+// scrollback), so the notice states the loss instead of suggesting a retry.
+const TAIL_FIRST_ROLES = new Set(["terminal"])
+
 function textOf(acc, roleName) {
     // Never leak a secret: AT-SPI exposes masked fields as role "password text".
     if (roleName === "password text") return "‹redacted›"
@@ -117,8 +128,28 @@ function textOf(acc, roleName) {
     // method explicitly to reach the (start, end) overload.
     const n = safe(() => Atspi.Text.prototype.get_character_count.call(iface), 0)
     if (!n) return null
-    const t = safe(() => Atspi.Text.prototype.get_text.call(iface, 0, Math.min(n, 2000)), null)
-    return typeof t === "string" && t.length ? t : null
+    // ⚠️ character_count OVER-REPORTS on VTE: measured 5535 against a get_text(0,n)
+    // that returned 4925 chars (it counts screen CELLS; the text drops trailing
+    // blanks per line). So it is usable as the upper bound of a range request and
+    // NOTHING else — deriving `n - MAX_TEXT` from it lands past the real end and
+    // AT-SPI answers with an EMPTY STRING, not an error. Take the tail by fetching
+    // the node whole and slicing here; only tail-first roles pay that (a terminal's
+    // visible grid is a few KB, unlike an arbitrary document).
+    // Head-first asks for one char PAST the cap: getting it back is the only
+    // reliable proof there was more (see above — n can't be compared against).
+    const tail = TAIL_FIRST_ROLES.has(roleName)
+    const want = tail ? n : Math.min(n, MAX_TEXT + 1)
+    let t = safe(() => Atspi.Text.prototype.get_text.call(iface, 0, want), null)
+    if (typeof t !== "string" || !t.length) return null
+    // On a character GRID every line comes padded to the full width, and that
+    // padding is cells, never content — measured 1402 of 5432 chars on one screen.
+    // Dropping it buys a quarter of the budget back, losslessly. Only for the grid
+    // roles: in a plain text widget a trailing space can be something someone typed.
+    if (tail) t = t.split("\n").map(l => l.replace(/[ \t]+$/, "")).join("\n")
+    if (t.length <= MAX_TEXT) return t
+    return tail
+        ? `‹… ${t.length - MAX_TEXT} earlier characters on screen omitted›\n${t.slice(-MAX_TEXT)}`
+        : `${t.slice(0, MAX_TEXT)}\n‹… truncated at ${MAX_TEXT} characters›`
 }
 
 function actionsOf(acc) {
@@ -269,12 +300,20 @@ function hyprActiveClass() {
 
 // Tolerant match between an AT-SPI app name and a Hyprland class — they rarely
 // match verbatim ("Files"/"nautilus" vs "org.gnome.Nautilus").
+// Last dot-segment, separators dropped: "org.gnome.Terminal" and "gnome-terminal"
+// both reduce to something the other contains. Symmetric on purpose — the caller
+// passes a Hyprland class in one place and an agent-supplied filter in another, and
+// EITHER side can be the dotted/hyphenated one. (The old version only split `cls`,
+// so a dotted appName against a hyphenated filter missed.)
+const canonName = (s) => (s || "").toLowerCase().split(".").pop().replace(/[-_ ]/g, "")
+
 function classMatches(appName, cls) {
     appName = (appName || "").toLowerCase()
+    cls = (cls || "").toLowerCase()
     if (!appName || !cls) return false
     if (cls.includes(appName) || appName.includes(cls)) return true
-    const tail = cls.split(".").pop()
-    return !!tail && (appName.includes(tail) || tail.includes(appName))
+    const a = canonName(appName), c = canonName(cls)
+    return !!a && !!c && (a.includes(c) || c.includes(a))
 }
 
 function selectTargets(filter) {
@@ -284,19 +323,27 @@ function selectTargets(filter) {
     const activeClass = filter ? null : hyprActiveClass()
     const targets = []
     const apps = []
-    for (const app of children(desktop)) {
-        const appName = safe(() => app.get_name(), "") || "?"
-        apps.push(appName)
-        for (const win of children(app)) {
-            const winName = safe(() => win.get_name(), "")
-            const label = winName ? `${appName} — ${winName}` : appName
-            const match = filter
-                ? appName.toLowerCase().includes(filter)
-                : activeClass
-                    ? classMatches(appName, activeClass)
-                    : isActive(win)
-            if (match) targets.push({ frame: win, label })
+    // An agent's vocabulary for "which app" comes from list_windows — i.e. Hyprland
+    // CLASSES — while the filter is matched against AT-SPI NAMES, and the two are
+    // not the same string ("gnome-terminal" vs "org.gnome.Terminal": no substring
+    // relation, so the plain pass returns zero). Rescue pass only, after a strict
+    // miss, so an exact substring keeps meaning exactly what it meant.
+    for (const tolerant of [false, true]) {
+        for (const app of children(desktop)) {
+            const appName = safe(() => app.get_name(), "") || "?"
+            if (!tolerant) apps.push(appName)
+            for (const win of children(app)) {
+                const winName = safe(() => win.get_name(), "")
+                const label = winName ? `${appName} — ${winName}` : appName
+                const match = filter
+                    ? tolerant ? classMatches(appName, filter) : appName.toLowerCase().includes(filter)
+                    : activeClass
+                        ? classMatches(appName, activeClass)
+                        : isActive(win)
+                if (match) targets.push({ frame: win, label })
+            }
         }
+        if (targets.length || !filter) break
     }
     return { targets, apps, activeClass }
 }
