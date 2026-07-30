@@ -88,11 +88,28 @@ export function AgentCompact(opts: { ghost?: boolean } = {}): Gtk.Widget {
 // ── Transcript bubbles ───────────────────────────────────────────────────────
 
 function makeToolChip(): { row: Gtk.Widget; update: (tc: ToolCall) => void } {
-    const dot = new Gtk.Box({ css_classes: ["agent-tool-dot"], width_request: 6, height_request: 6, valign: Gtk.Align.CENTER })
+    // Size comes from CSS `min-width`/`min-height`, NOT from a size request. In
+    // GTK4 a CSS margin is drawn INSIDE the widget's allocation and a size
+    // request is the minimum of that allocation, so request + margin SHRINKS the
+    // visible box: 6×6 requested with a 2px margin measured 6×4 on screen and
+    // rendered the dot as a horizontal oval. `min-height` is the content box, so
+    // it survives the nudge below.
+    const dot = new Gtk.Box({ css_classes: ["agent-tool-dot"], valign: Gtk.Align.CENTER })
     const label = new Gtk.Label({ css_classes: ["agent-tool-label"], valign: Gtk.Align.CENTER, ellipsize: 3, max_width_chars: 40, xalign: 0 })
-    const row = new Gtk.Box({ css_classes: ["agent-tool-chip"], spacing: 6 })
-    row.append(dot)
-    row.append(label)
+    // halign START so the pill HUGS its label. Inside a bubble it could span the
+    // full width harmlessly; bare on the glass, a full-width pill reads as a band
+    // across the panel instead of as a marker on a line of prose.
+    const pill = new Gtk.Box({ css_classes: ["agent-tool-chip"], spacing: 6, halign: Gtk.Align.START })
+    pill.append(dot)
+    pill.append(label)
+    // The narration that preceded this call, dimmed but at FULL SIZE, above it.
+    // Not ellipsized and not clipped: "Nautilus wasn't focused, focusing it" was
+    // the most useful sentence of the run it came from — the point is to demote
+    // it from answer to context, not to hide it or to shrink it into a caption.
+    const interim = new Gtk.Label({ css_classes: ["agent-interim-text"], wrap: true, xalign: 0, halign: Gtk.Align.START, visible: false })
+    const row = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 3 })
+    row.append(interim)
+    row.append(pill)
     // A chip appears when the tool STARTS and only later learns its outcome, so
     // between those two beats the dot breathes: that is the difference between
     // "running this now" and "ran this", which the chip could not express before.
@@ -101,10 +118,12 @@ function makeToolChip(): { row: Gtk.Widget; update: (tc: ToolCall) => void } {
         row,
         update: (tc) => {
             label.label = tc.summary
+            interim.label = tc.interim ?? ""
+            interim.visible = !!tc.interim
             breath.setActive(tc.ok === undefined)
             // Semantic, never accent: a shell rejection tints the dot danger.
-            if (tc.ok === false) row.add_css_class("agent-tool-fail")
-            else row.remove_css_class("agent-tool-fail")
+            if (tc.ok === false) pill.add_css_class("agent-tool-fail")
+            else pill.remove_css_class("agent-tool-fail")
         },
     }
 }
@@ -131,7 +150,10 @@ function makeBubble(turn: Turn): { row: Gtk.Widget; rendered: RenderedTurn } {
         halign: Gtk.Align.START,
         selectable: !isUser,
     })
-    const toolsBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 4, css_classes: ["agent-tool-chips"] })
+    // 6, not the old 4: each entry is now a STEP (its narration plus the chip it
+    // led to), not a bare pill in a stack, and the gap between steps is the only
+    // thing grouping a sentence with the action it explains.
+    const toolsBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6, css_classes: ["agent-tool-chips"] })
     // Abnormal end (provider error, daemon death, empty completion). Its own row,
     // not appended to the text: a turn that streamed half an answer and then died
     // must SHOW that it died.
@@ -140,24 +162,56 @@ function makeBubble(turn: Turn): { row: Gtk.Widget; rendered: RenderedTurn } {
     // rule (same as the failed tool chip right above, same as the critical
     // battery glyph). Red text on glass reads badly, which is why the first cut
     // of this was rejected.
-    const errorDot = new Gtk.Box({ css_classes: ["agent-error-dot"], width_request: 6, height_request: 6, valign: Gtk.Align.START })
+    // Sized in CSS for the same reason as the tool-chip dot, and here the bug it
+    // avoids was already SHIPPED: this dot requested 6×6 and carries a 5px top
+    // margin, so it was rendering 6×1 — a hairline, not a dot. Only an abnormal
+    // turn end paints it, which is why nobody caught it.
+    const errorDot = new Gtk.Box({ css_classes: ["agent-error-dot"], valign: Gtk.Align.START })
     const errorText = new Gtk.Label({ css_classes: ["agent-error-text"], wrap: true, xalign: 0, halign: Gtk.Align.START })
     const errorLabel = new Gtk.Box({ css_classes: ["agent-error-row"], spacing: 6, visible: false })
     errorLabel.append(errorDot)
     errorLabel.append(errorText)
+    // ── THE WORK IS NOT BUBBLED; ONLY THE ANSWER IS ──────────────────────────
+    //
+    // A bubble says "one utterance". A turn with six calls is not one utterance,
+    // and wrapping the whole thing in a single bubble was what made the steps
+    // read as one undifferentiated block — the user's words: everything ends up
+    // in the same bubble, only the final answer reads well.
+    //
+    // So the work — narration and chips — renders BARE on the panel glass, and
+    // the answer keeps the bubble. The differentiator is the BACKGROUND, which
+    // costs no chrome at all: the reply is the only thing in the turn wearing
+    // one, so it separates itself no matter how many steps ran. Same model as
+    // Claude Code / Cursor, where an assistant turn is a stream of blocks and
+    // the reply is simply the last one.
+    //
+    // The corollary is that narration goes back to FULL SIZE (dim, not shrunk).
+    // Shrinking it was the first cut's real mistake: the opening sentence of a
+    // turn is not the caption of the chip that happens to follow it, and typing
+    // it at 11px labelled it as one.
+    //
+    // Ordering is chronological — chips ran BEFORE the sentence that ends the
+    // turn — and that is also why the answer lands where the transcript
+    // auto-scrolls to. Do not put the answer back on top.
     const bubble = new Gtk.Box({
         orientation: Gtk.Orientation.VERTICAL,
         spacing: 6,
+        halign: Gtk.Align.START,
         css_classes: ["agent-bubble", isUser ? "agent-bubble-user" : "agent-bubble-assistant"],
     })
-    // Working indicator — only ever mounted in an assistant bubble.
-    const pulse = isUser ? null : makePulseDots()
     bubble.append(textLabel)
-    if (pulse) bubble.append(pulse.widget)
-    bubble.append(toolsBox)
     bubble.append(errorLabel)
-    // Assistant left, user right — the bubble hugs its content; the row aligns it.
-    const row = new Gtk.Box({ halign: isUser ? Gtk.Align.END : Gtk.Align.START })
+    // Working indicator — only ever mounted in an assistant turn.
+    const pulse = isUser ? null : makePulseDots()
+    // A user turn is one utterance and keeps the plain bubble; only the
+    // assistant's splits into work + answer.
+    const row = new Gtk.Box({
+        orientation: Gtk.Orientation.VERTICAL,
+        spacing: 6,
+        halign: isUser ? Gtk.Align.END : Gtk.Align.FILL,
+    })
+    if (pulse) row.append(pulse.widget)
+    if (!isUser) row.append(toolsBox)
     row.append(bubble)
 
     const chips: Array<ReturnType<typeof makeToolChip>> = []
@@ -182,6 +236,11 @@ function makeBubble(turn: Turn): { row: Gtk.Widget; rendered: RenderedTurn } {
         toolsBox.visible = tn.tools.length > 0
         errorText.label = tn.error ?? ""
         errorLabel.visible = !!tn.error
+        // The bubble now holds ONLY the ending — the answer, or the error that
+        // replaced it. It must not paint while a turn is still working its way
+        // through tools, or an empty rounded rectangle sits under the chips for
+        // the length of the turn.
+        bubble.visible = !!tn.text || !!tn.error
         // An assistant turn is pushed EMPTY the moment you send. It stays hidden
         // when there is genuinely nothing to say (a finished turn with no
         // content is a bug caught elsewhere), but while it is PENDING the row

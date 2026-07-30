@@ -354,6 +354,8 @@ window#nidara-bar-zone {
         // the mark or the fill, never in the copy).
         .agent-error-row { margin-top: 2px; }
         .agent-error-dot {
+            min-width: 6px;                      // size here, NOT a size request
+            min-height: 6px;                     // (the margin below would eat it)
             margin-top: 5px;                     // optical: aligns to the first text line
             border-radius: var(--nidara-radius-pill);
             background: var(--nidara-danger);
@@ -370,14 +372,50 @@ window#nidara-bar-zone {
         background: var(--nidara-surface);
     }
 
-    .agent-tool-chips { margin-top: 2px; }
+    /* The WORK half of an assistant turn — narration + chips — is deliberately
+       UNBUBBLED: it sits bare on the panel glass so that the answer, which keeps
+       its bubble, is the only thing in the turn wearing a background. That is the
+       whole separation mechanism, and it costs no chrome. See makeBubble. */
+    .agent-interim-text {
+        /* FULL SIZE, dimmed. It was $fs-mini in the first cut and that was the
+           mistake: the opening sentence of a turn is not the caption of whatever
+           chip follows it, and 11px prose labelled it as one. Colour alone
+           carries "this was on the way, not the reply" — the answer's BUBBLE is
+           what carries the hierarchy now. */
+        font-size: $fs-small;
+        color: var(--nidara-text-dim);
+    }
+    /* `--nidara-surface`, NOT `surface-back`. Inside the old bubble the chip
+       stacked 0.04 over 0.08 and read at ~0.12; bare on the glass, 0.04 alone
+       was nearly invisible (measured by eye on the live panel, which is the only
+       instrument for this — see the screenshot caveat in tech-debt). It now
+       matches the answer bubble's alpha and the hierarchy is carried by SHAPE
+       instead: a small hugging pill against a wide filled block. */
     .agent-tool-chip {
         padding: 3px 8px;
         border-radius: var(--nidara-radius-pill);
-        background: var(--nidara-surface-back);
+        background: var(--nidara-surface);
         .agent-tool-dot {
+            /* The SIZE lives here, not in a size request — see makeToolChip. A
+               request plus the margin below would render 6×4. */
+            min-width: 6px;
+            min-height: 6px;
             border-radius: var(--nidara-radius-pill);
             background: var(--nidara-text-dim);
+            /* Optical nudge DOWNWARD, measured off the rendered pixels rather
+               than reasoned about: geometrically centred, the dot's centre landed
+               2px above the label's ink. The margin joins the CENTRED outer box,
+               so it only moves the dot by half of itself: dot centre = content
+               centre + margin/2. Measured at margin 2 the centre landed on 18.5
+               against ink centring on 19.5, which confirmed the formula and gave
+               the remaining px — at 4 the dot occupies exactly the same rows as
+               the text ink (y17–22 in the sample that settled it).
+
+               The opposite nudge was tried FIRST, on the theory that descender
+               space makes a centred dot look LOW. The pixels said otherwise. Do
+               not re-derive the direction from reasoning; crop and read the rows
+               (see design-system.md). */
+            margin-top: 4px;
         }
         .agent-tool-label {
             font-size: $fs-mini;
