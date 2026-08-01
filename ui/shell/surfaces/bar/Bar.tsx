@@ -518,8 +518,17 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
   appTitleWidget.set_visible(barSettings.showAppTitle)
   left.append(sysMenuWidget)
   left.append(appTitleWidget)
+  // NO spacing — the gap lives on each chip's own margin (see ActivityIsland).
+  // A Gtk.Box reserves its spacing between every VISIBLE child, and a collapsed
+  // Gtk.Revealer is still visible (it just measures 0), so spacing here would
+  // hold a permanent 8px to the right of the capsule and leave it off-centre in
+  // an idle session — the one state that must look exactly as it always has.
+  // The GROUP is what centres: a chip appearing shifts the capsule off the
+  // monitor's axis, which is the cost of the iOS split and is only ever paid
+  // while something is actually running.
   const center = new Gtk.Box({ css_classes: ["bar-center"], halign: Gtk.Align.CENTER })
-  center.append(island.capsule)   // the island's compact state (workspace dots)
+  center.append(island.capsule)      // the island's compact state
+  center.append(island.indicatorRow) // live activities that are NOT fronting it
   center.set_visible(barSettings.showWorkspaces)
   // `center` is NOT put in the bar's CenterBox: the capsule paints on the
   // island's surface (see islandWin above). It goes into a row that reuses the
@@ -531,7 +540,7 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
   const islandRow = new Gtk.Box({ css_classes: ["bar-centerbox"], height_request: BAR_H, valign: Gtk.Align.START })
   islandRow.append(center)
   center.hexpand = true           // halign CENTER inside a full-width row
-  islandWin.mount(islandRow, island.capsule, island.revealers)
+  islandWin.mount(islandRow, island.hitTargets, island.revealers)
   // The capsule is a CLICK TARGET living on a mostly click-through surface, so
   // its rect in the input region has to track its real size — and that size
   // moves on its own: the compact stack interpolates width when the fronting
@@ -539,6 +548,16 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
   // with no page change at all. The glass DrawingArea's `resize` fires on
   // exactly those, and only those.
   ;(island.capsule as any).glassArea?.connect("resize", () => islandWin.updateInputRegion())
+  // A chip appearing or leaving moves the capsule sideways WITHOUT resizing it,
+  // so the resize hook above never fires for it and both the chip's rect and the
+  // capsule's displaced one would stay unstamped. Re-stamped after the reveal
+  // lands (the slide takes COMPACT_SWAP_MS; the capsule may still be settling,
+  // and while it is, the resize hook keeps stamping anyway).
+  island.onBackgroundChanged(() => {
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
+      islandWin.updateInputRegion(); return GLib.SOURCE_REMOVE
+    })
+  })
   const right = new Gtk.Box({ css_classes: ["bar-right"], halign: Gtk.Align.END, spacing: 8 })
   // Absorbs SizeGroup slack so actual capsules stay pinned to the right edge.
   // When left > right (long window title), SizeGroup widens the right allocation;
@@ -590,6 +609,9 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
       row.append(new Gtk.Label({ label: w.name, halign: Gtk.Align.START, hexpand: true }))
       const btn = new Gtk.Button({ child: row, css_classes: ["nidara-menu-row"], hexpand: true })
       btn.connect("clicked", () => {
+        // Same first refusal as a visible pill (see rebuildBarWidgets) — an
+        // overflowed widget must not behave differently from a shown one.
+        if (w.barClick?.()) { status.bar_expanded_id = ""; return }
         if (hasExpand) {
           status.bar_expanded_id = id
         } else if (hasCCDetail) {
@@ -631,11 +653,21 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
       // cc_edit_mode (not cc_open): while editing the CC the pills stay inert;
       // with the CC merely open, a pill click switches to its surface directly
       // (the bar_expanded_id setter closes the exclusive overlays).
-      const onRelease = hasExpand
-          ? () => { if (status.cc_edit_mode) return; status.bar_expanded_id = status.bar_expanded_id === id ? "" : id }
+      // barClick gets first refusal on EVERY click (asked here, not cached at
+      // build time) so a widget can act directly in a state where opening a panel
+      // would only be in the way — screenrecord stops the capture. See Types.ts.
+      const open = hasExpand
+          ? () => { status.bar_expanded_id = status.bar_expanded_id === id ? "" : id }
           : hasCCDetail
-              ? () => { if (status.cc_edit_mode) return; status.cc_open = true; status.cc_detail_id = id }
+              ? () => { status.cc_open = true; status.cc_detail_id = id }
               : undefined
+      const onRelease = (hasExpand || hasCCDetail || w.barClick)
+          ? () => {
+              if (status.cc_edit_mode) return
+              if (w.barClick?.()) { status.bar_expanded_id = ""; return }
+              open?.()
+          }
+          : undefined
       const capsule = SquircleContainer({
           child: w.buildBarContent(), gloss: true, useShellOpacity: true, chrome: true, opacityRole: "bar",
           borderColor: CAPSULE_BORDER, hoverBorderAccent: true, perfect: true,

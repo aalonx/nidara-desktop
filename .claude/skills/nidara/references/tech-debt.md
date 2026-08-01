@@ -406,6 +406,16 @@ polish/optimization. If the hover growth ever truly must stop, it needs a struct
 (custom Cairo indicator or non-overlay reserved scrollbar with its own reflow tradeoff), not
 more specificity. Same root as #9 (the Adwaita stylesheet is loaded in-process).
 
+### 16b. Adwaita button classes still in three widgets (2026-08-02)
+`widgets/vpn.ts`, `widgets/bluetooth.ts` and `widgets/screenshot.ts` (save) still build buttons with
+`suggested-action`/`destructive-action`. They LOOK right only because they render inside
+`.bar-expansion-panel` or `.cc-detail-panel`, the two scopes that restyle those Adwaita classes —
+move one of those buttons anywhere else and it turns Adwaita blue/red on the spot (which is exactly
+what happened to the island capture card and the CC banner row before they were converted). Low
+urgency, zero visible symptom today; convert to `NidaraButton` when touching those widgets. NOT to
+be confused with `.nidara-seg-btn.suggested-action` (segmented-control SELECTED marker, legitimate,
+owns its rule in `_components.scss`).
+
 ### 17. Status-indicator subsystem: extension points deliberately not wired (2026-06-19)
 `surfaces/bar/StatusIndicators.tsx` is a declarative registry (`INDICATORS`, three states
 hidden/armed/active) rendered as a small **badge on the bar's Control-Center button**
@@ -413,6 +423,21 @@ hidden/armed/active) rendered as a small **badge on the bar's Control-Center but
 Stop/kill-switch lives). It currently hosts only recording + AI-control but is the intended home for
 **privacy/activity indicators** (mic, camera, screen-share, location). Those are **not wired** (no
 source detection yet); adding one = a new `INDICATORS` entry with `state()` + `subscribe()` + `onClick`.
+The banner is a **Cairo island** since 2026-08-02 (user call), not a CSS `material-card`: same
+painter/gloss/border/inset as the tiles below it, transparent CSS background, `margin-bottom: 24px`
+(the CC's BLOCK rhythm — the air the Edit pill gets; 12px is the WITHIN-block tile gap, and using it
+made the card look stuck to the grid). It also lost its danger tint on background AND border: four
+reds on one row — tint, border, dot, Adwaita-red button — read as "something has gone wrong"
+instead of "AI control is on". It states a fact and offers the switch; the red left is the dot. Its
+button is `NidaraButton({variant:"secondary"})` — revoking a permission is reversible, and `danger`
+means destructive.
+**Recording left the registry entirely** on 2026-08-02 (badge-only from 08-01, then gone): the island
+owns the live capture end to end, and the badge must never point at a CC that has nothing to show —
+the screenrecord tile is opt-in and can be bar-only. The `banner?: boolean` opt-out that existed for
+one day went with it (no consumer left). The boundary that settled it: **the CC says what is GRANTED
+(permissions, and the kill switch), the island says what is RUNNING.** A privacy indicator with no
+island activity behind it (mic, camera) gets a full entry here; anything the island already shows
+live gets none.
 Also deferred by product decision: **drag-reorder of bar widgets** (bar order is category-derived via
 `barOrder`; the CC has its own Edit-mode reorder). The AI "active" signal depends on the tools pinging
 `notifyComputerAction` — an action path that bypasses `nidara-act/type/click` would stay "armed", not
@@ -1169,11 +1194,17 @@ Ordered by what hurt most in the live run:
      expand-on-finish pops the island open with the answer when the desktop is otherwise idle.
    - **Island open, user watching** → the arriving text IS the beat, same as every chat UI
      (ChatGPT, Claude). Adding a chime/flash here would be noise. Deliberately nothing.
-   - **⚠️ THE REAL HOLE: the turn finishes while another overlay is open** (CC, Search…). Expand-on-
-     finish is suppressed on purpose — never steal from another overlay — so the answer lands with
-     **zero** signal: the glyph just settles back to the workspace dots as if nothing happened. Fix
-     direction: the capsule should hold an "unread answer" mark until the island is opened, instead
-     of reverting. Not built; judge it in use first.
+   - ~~**THE REAL HOLE: the turn finishes while another overlay is open**~~ **CLOSED 2026-08-01**,
+     and not by the fix this entry proposed. The plan was an "unread" mark on the CAPSULE, which
+     would have been a mechanism serving one case. The island's INDICATOR ROW made it a property of
+     something already on screen instead: `AgentService.unread` (`"answer" | "error" | null`) is set
+     at turn end exactly where expand-on-finish stands down, cleared by `island_mode === ISLAND_AGENT`
+     (in the service, so no route into the island can leave it stale), and painted as a badge on the
+     assistant's chip — which is already there, because a configured assistant is always indicated.
+     **It covers the silent ERRORS too** (`failTurn`'s suppressed branch, the half this entry never
+     mentioned), badged in danger colour: an error and an answer are not equally good news. The
+     lesson is the one the user made the call on: a general surface absorbs the special case, so
+     wait for it rather than patching the case alone.
 5. ~~**Replies ignore the UI language.**~~ **The item was WRONG — reframed by the user 2026-07-21.**
    The desired behaviour is the opposite of what it asked for: **the assistant replies in the language
    of the MESSAGE, and follows the user if they switch. The desktop locale is a hint for the ambiguous
