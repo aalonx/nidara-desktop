@@ -597,6 +597,52 @@ in Settings → Control Center, or an app icon), pass `NidaraRow`'s `leadingIcon
 through `createRow(label, subtitle, widget, titleIcon, leadingIcon)`) — it sits as the row's
 first child, before the title column.
 
+**A row has three zones — `[leadingIcon] [text (expands)] [control]` — and the trailing slot is
+for ONE control.** The moment you find yourself building a `Gtk.Box` of unrelated things to pass
+as `widget`, the row is telling you something belongs in another zone. A preview thumbnail is a
+leading icon, not the first item in a button box: cramming it trailing reads as one dense clump
+shoved against the right edge with the text stranded far left, and it looks like the layout is
+saving space. This is a RECURRING slip, not a one-off — Settings → Top bar (launcher icon) and
+Settings → Apps → app detail (icon override) both did it, with byte-identical copies of the
+preview box, the two buttons and the `Gtk.FileDialog` (user-caught 2026-08-02: *"está todo
+apretado en la misma fila"*). Both now build on **`imagePickerRow`** (`SettingsHelpers.ts`), the
+shared "pick an image for this" row: preview leading, text middle, `[Choose image…] [reset]`
+trailing, dialog and SVG/PNG filters included; callers supply only `renderPreview` / `isCustom` /
+`onPick` / `onReset`. Use it for any new image-picking setting rather than a fourth copy.
+
+Two legitimate escapes when one control genuinely will not fit the trailing slot: **`createStackedRow`**
+(control on its own full-width line beneath the text — for entries and button pairs) and a
+dedicated preview row of its own (Settings → Gaming's wallpaper, Users' avatar, where the image is
+large enough to be the row).
+
+**Inside a stacked row, keep going: one control per line, actions last.** Moving to
+`createStackedRow` buys a whole card's width — spending it on a field and its buttons side by side
+just reproduces the squeeze one level down, with the entry pinned to a `width_chars` stub and the
+three reading as one clump. Use **`fieldWithActions(field, ...buttons)`** (`SettingsHelpers.ts`):
+the field takes the full width, the buttons sit on their own line beneath, right-aligned with the
+primary LAST. `actionRow(...buttons)` is that button line on its own, for stacks with extra parts.
+This bit Settings → AI twice over (user-caught 2026-08-02): the API-key row had entry + Save +
+Forget on one line, and the model row had an entry, a dropdown AND "Find models" competing for a
+single line once a fetch succeeded. Note what the model row teaches about ORDER — the catalog
+dropdown writes into the entry above it, so it is a picker for that field and belongs directly
+under it, while the button that *populates* the dropdown is an action and goes in the action line.
+Group by what a control DOES to the field, not by what it looks like.
+
+**A picker is not a second place the value lives.** When a control's job is to write into another
+control, it must not also display the result — one value shown in two widgets stacked on top of
+each other reads as a duplicate, and the user asks why it appears twice (2026-08-02, the model
+row). Park the picker on its placeholder permanently: the catalog dropdown rests on
+"Choose a model…" forever, the entry above is the single display, and the id landing there IS the
+confirmation the pick registered. Two things fall out for free — the bare-id matching needed to
+preselect the configured model disappears along with the preselect, and re-picking the model you
+are already on starts working (`notify::selected` never fires when the chosen row is already
+selected, so a sticky selection silently made straying from a model a one-way trip). Snapping back
+to row 0 re-enters the handler, so it needs the same `suppressDropCb` guard as the rebuild.
+
+⚠️ The AI page was cited as prior art for this shape while it was itself wrong, and Settings →
+Users' name row was converted to match it before anyone noticed. When you copy a layout from
+another page, check it against the rule rather than assuming the older page earned it.
+
 ## CC capsule tiles: stateful vs action (no fake status line)
 
 The 2×1 (WIDE) CC tile built by `buildCapsuleInner(getIcon, getTitle, getSubTitle)` (in

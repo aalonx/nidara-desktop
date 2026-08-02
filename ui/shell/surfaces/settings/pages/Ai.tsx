@@ -1,6 +1,6 @@
 import { Gtk } from "ags/gtk4"
 import Secret from "gi://Secret"
-import { listGroup, pageBox, toggleRow, createRow, createStackedRow, dropdownRow, staticLabel } from "../SettingsHelpers"
+import { listGroup, pageBox, toggleRow, createRow, createStackedRow, dropdownRow, staticLabel, actionRow, fieldWithActions } from "../SettingsHelpers"
 import { NidaraButton } from "../../../../lib/nidara-kit"
 import agentConfig from "../../../core/AgentConfig"
 import { AGENT_PROVIDERS, providerById } from "../../../core/AgentProviders"
@@ -163,12 +163,30 @@ export default function AiPage() {
     // catalog can't simply be left unselected: without a placeholder the first
     // model in the list always looks chosen, which reads as "this is your model"
     // for something the user never picked (user-caught 2026-07-22).
+    //
+    // And it RESTS on that placeholder forever: the dropdown is a menu you pick
+    // from, not a second place the value lives. It used to preselect the
+    // configured model, which put the same id in the entry AND in the list right
+    // below it — one value shown twice, and the reason the pair read as
+    // redundant (user-caught 2026-08-02). The entry above is the single display
+    // of the value, and the id landing in it IS the confirmation that the pick
+    // registered. Snapping back also makes re-picking the current model work,
+    // which a sticky selection silently forbade (no `notify::selected` when the
+    // chosen row is already selected — so retyping was the only way back to a
+    // model you had strayed from).
     modelDrop.connect("notify::selected", () => {
         if (suppressDropCb) return
         // Row 0 selects nothing on purpose — never commit it over a real value.
+        // It is also where we park ourselves after every pick, and that write
+        // re-enters here: without the early-out it would commit the placeholder.
         if (modelDrop.selected === 0) return
         const item = modelList.get_string(modelDrop.selected)
         if (item) { modelEntry.set_text(item); commitModel() }
+        // Back to "Choose a model…" — guarded, since this is a selection change
+        // like any other and would otherwise re-enter the handler above.
+        suppressDropCb = true
+        modelDrop.selected = 0
+        suppressDropCb = false
     })
 
     const fetchBtn = NidaraButton({ label: t("settings.ai.brain.model.fetch"), pill: true })
@@ -198,15 +216,14 @@ export default function AiPage() {
                 while (modelList.get_n_items() > 0) modelList.remove(0)
                 modelList.append(t("settings.ai.brain.model.choose"))
                 r.models.forEach(m => modelList.append(m))
-                // Preselect the configured model, comparing on the BARE id: the
-                // stored value may still carry Google's `models/` prefix (the
-                // compat spelling) while the catalog is now normalised without it,
-                // and a mismatch here silently looks like "your model isn't offered".
-                const bare = (s: string) => s.replace(/^models\//, "")
-                const idx = r.models.findIndex(m => bare(m) === bare(agentConfig.brainModel))
-                // +1 for the placeholder row; 0 means "none matched", which is
-                // exactly the placeholder — no model gets chosen on the user's behalf.
-                modelDrop.selected = idx >= 0 ? idx + 1 : 0
+                // Rests on the placeholder — the catalog never displays the
+                // configured model, the entry above does. This used to preselect
+                // it (matching on the BARE id, since a stored value may still
+                // carry Google's `models/` prefix while the catalog is normalised
+                // without it), which is precisely what showed one value twice.
+                // Dropping the preselect drops that whole matching problem with
+                // it: nothing here claims anything about your model any more.
+                modelDrop.selected = 0
                 suppressDropCb = false
                 modelDrop.visible = true
                 modelStatus.visible = false
@@ -217,10 +234,20 @@ export default function AiPage() {
         })
     })
 
-    const modelLine = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER })
-    modelLine.append(modelEntry); modelLine.append(modelDrop); modelLine.append(fetchBtn)
-    const modelBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 })
-    modelBox.append(modelLine); modelBox.append(modelStatus)
+    // One control per line: the id you are setting, the catalog that fills it once
+    // "Find models" answers, then the action, then its status. All three used to
+    // share a single row, so after a fetch an entry, a dropdown and a button
+    // competed for one line and each got a stub of it (user-caught 2026-08-02).
+    // The dropdown WRITES INTO the entry (see notify::selected) — it is a picker
+    // for the field above it, not a second field, which is why it sits directly
+    // under it rather than beside the button that populates it.
+    modelEntry.hexpand = true
+    modelDrop.hexpand = true
+    const modelBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 8 })
+    modelBox.append(modelEntry)
+    modelBox.append(modelDrop)
+    modelBox.append(actionRow(fetchBtn))
+    modelBox.append(modelStatus)
     const model = {
         row: createStackedRow(t("settings.ai.brain.model"), t("settings.ai.brain.model.desc"), modelBox),
         entry: modelEntry,
@@ -244,17 +271,29 @@ export default function AiPage() {
 
     // API key row: a password entry + save/clear, status carried in the placeholder
     // (the stored key is never re-shown).
-    const keyEntry = new Gtk.PasswordEntry({ show_peek_icon: true, valign: Gtk.Align.CENTER, width_chars: 16 })
+    const keyEntry = new Gtk.PasswordEntry({ show_peek_icon: true, valign: Gtk.Align.CENTER })
     // Labelled "Save key" / "Forget key", not "Save" / "Clear": this is the ONLY
     // button on a page where every other field commits on Enter/focus-out, so a bare
     // "Save" reads as "save the whole form" (user-caught 2026-07-21).
     const saveBtn = NidaraButton({ label: t("settings.ai.brain.key.save"), variant: "primary", pill: true })
     const clearBtn = NidaraButton({ label: t("settings.ai.brain.key.clear"), pill: true })
-    // Stacked row: the entry + its two buttons get the full width of the card. In
-    // the trailing slot of a normal row the entry was squeezed to a stub.
-    keyEntry.hexpand = true
-    const keyBox = new Gtk.Box({ spacing: 8, valign: Gtk.Align.CENTER })
-    keyBox.append(keyEntry); keyBox.append(saveBtn); keyBox.append(clearBtn)
+    // Says what the keyring just did. Storing is the one action on this page with
+    // NO visible result: `Secret.password_store` REPLACES the item with the same
+    // attributes, so overwriting a key clears the entry and restores the exact
+    // "•••• stored" placeholder that was there before — identical to having done
+    // nothing, or to a silent failure ("does it overwrite, does it add, what?" —
+    // user, 2026-08-02). The answer now appears in the UI instead of only in
+    // libsecret's semantics.
+    const keyStatus = new Gtk.Label({
+        css_classes: ["nidara-row-subtitle"], halign: Gtk.Align.START, xalign: 0,
+        wrap: true, visible: false,
+    })
+    const sayKey = (msg: string) => { keyStatus.label = msg; keyStatus.visible = true }
+
+    // Buttons BENEATH the field, not beside it — see `fieldWithActions`. Forget
+    // sits left of Save: right-aligned actions put the primary last.
+    const keyBox = fieldWithActions(keyEntry, clearBtn, saveBtn)
+    keyBox.append(keyStatus)
     const keyRow = createStackedRow(t("settings.ai.brain.key"), t("settings.ai.brain.key.desc"), keyBox)
 
     function refreshKeyUI() {
@@ -276,12 +315,18 @@ export default function AiPage() {
     const commitKey = () => {
         const k = keyEntry.get_text().trim()
         if (!k) return
+        // Read BEFORE the write: the store replaces in place, so afterwards there is
+        // no way to tell a first save from an overwrite.
+        const had = hasKey(agentConfig.brainProvider)
         // The keyring may put a password dialog up (creating/unlocking the login
         // keyring). Disable the button meanwhile so the row reads as "working"
         // instead of dead, and let the async callback re-enable it.
         saveBtn.sensitive = false
         storeKey(agentConfig.brainProvider, k, (ok) => {
             if (ok) keyEntry.set_text("")
+            sayKey(!ok ? t("settings.ai.brain.key.failed")
+                 : had ? t("settings.ai.brain.key.replaced")
+                       : t("settings.ai.brain.key.saved"))
             refreshKeyUI()
         })
     }
@@ -292,6 +337,7 @@ export default function AiPage() {
         clearBtn.sensitive = false
         clearKey(agentConfig.brainProvider, () => {
             keyEntry.set_text("")
+            sayKey(t("settings.ai.brain.key.cleared"))
             refreshKeyUI()
         })
     })
@@ -311,6 +357,12 @@ export default function AiPage() {
         // switch, or Anthropic's list would sit there offering models to Ollama.
         modelDrop.visible = false
         modelStatus.visible = false
+        // Same reasoning for the key verdict: "Key replaced" is about the provider
+        // that was selected when it was written, and keys are stored PER PROVIDER,
+        // so leaving it up would claim something about the one just switched to.
+        // (Not cleared in refreshKeyUI — commitKey calls that right after posting
+        // its message, which would hide the verdict in the same tick.)
+        keyStatus.visible = false
         refreshKeyUI()
     }
 
