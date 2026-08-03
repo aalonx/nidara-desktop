@@ -5,7 +5,8 @@ import widgetConfig from "../../core/WidgetConfig"
 import registry from "../../widgets/index"
 import Icons from "../../core/Icons"
 import { t } from "../../core/i18n"
-import SquircleContainer from "../../common/SquircleContainer"
+import SquircleContainer, { GLASS_INSET } from "../../common/SquircleContainer"
+import { RADIUS, rowInsetFor } from "../../../lib/tokens"
 import { menuRow, menuSeparator } from "../../common/MenuRow"
 
 // Right-click context menu for CC tiles.
@@ -61,12 +62,16 @@ export function createCCContextMenu(opts: CCContextMenuOpts = {}): CCContextMenu
     const rows = new Gtk.Box({
         orientation: Gtk.Orientation.VERTICAL,
         spacing: 2,
-        margin_top: 9, margin_bottom: 9, margin_start: 9, margin_end: 9,
+        // The halo from the GLASS, all four sides — the row hover fill spans this box.
+        // Squircle corner (default `n`), so 6: same call as the system menu, and the same
+        // reason the bar's circular panel gets a different number from the same radius.
+        margin_top: rowInsetFor(RADIUS.lg) + GLASS_INSET, margin_bottom: rowInsetFor(RADIUS.lg) + GLASS_INSET,
+        margin_start: rowInsetFor(RADIUS.lg) + GLASS_INSET, margin_end: rowInsetFor(RADIUS.lg) + GLASS_INSET,
     })
 
     const card = SquircleContainer({
         child: rows,
-        radius: 20,
+        radius: RADIUS.lg,
         gloss: true,
         // Near-opaque: GTK can't blur a widget against sibling content on the same
         // surface, so the menu must occlude the tiles beneath it. useShellOpacity

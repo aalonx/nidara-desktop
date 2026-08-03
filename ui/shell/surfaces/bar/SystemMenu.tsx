@@ -5,7 +5,8 @@ import { execAsync } from "ags/process"
 import status from "../../core/Status"
 import Icons from "../../core/Icons"
 import shellActions from "../../core/ShellActions"
-import SquircleContainer from "../../common/SquircleContainer"
+import SquircleContainer, { GLASS_INSET } from "../../common/SquircleContainer"
+import { RADIUS, rowInsetFor } from "../../../lib/tokens"
 import { t } from "../../core/i18n"
 
 // System menu dropdown (About / Settings / Lock / Suspend / Logout / Restart / Shutdown)
@@ -31,7 +32,17 @@ export function SystemMenuOverlay() {
   const menuBox = new Gtk.Box({
     orientation: Gtk.Orientation.VERTICAL,
     spacing: 2,
-    margin_top: 10, margin_bottom: 10, margin_start: 10, margin_end: 10,
+    // The halo from the GLASS, all four sides: the row's hover fill spans this box, so
+    // this margin IS the gap between the hover and the card's edge. Default `n` (3.2):
+    // this card is a squircle, which barely intrudes into its own corner, so it wants 6
+    // where the bar's circular `perfect: true` panel wants 14 at the same radius.
+    // ⚠️ Twice user-caught here. The first fix read `expansionInner`'s constructor
+    // (12) and wrote 12 — but Bar.tsx REWRITES that margin on every open, and the
+    // number that ships is measured from the widget rect, so this menu still sat
+    // 10 from the glass against its siblings' 12. Use the token, not a literal
+    // copied from another file's constructor.
+    margin_top: rowInsetFor(RADIUS.lg) + GLASS_INSET, margin_bottom: rowInsetFor(RADIUS.lg) + GLASS_INSET,
+    margin_start: rowInsetFor(RADIUS.lg) + GLASS_INSET, margin_end: rowInsetFor(RADIUS.lg) + GLASS_INSET,
   })
 
   const makeRow = (ico: Gio.FileIcon, txt: string, _danger: boolean, cmd: () => void) => {
@@ -114,14 +125,19 @@ export function SystemMenuOverlay() {
     showPage(menuBox)
   })
 
-  const confirmBtnRow = new Gtk.Box({ spacing: 6, homogeneous: true, margin_top: 4 })
+  const confirmBtnRow = new Gtk.Box({ spacing: 8, homogeneous: true, margin_top: 4 })
   confirmBtnRow.append(confirmCancelBtn)
   confirmBtnRow.append(confirmActionBtn)
 
   const confirmBox = new Gtk.Box({
     orientation: Gtk.Orientation.VERTICAL,
-    spacing: 10,
-    margin_top: 16, margin_bottom: 14, margin_start: 10, margin_end: 10,
+    spacing: 12,
+    // Horizontal matches menuBox: the confirm page swaps INTO the same card, so its
+    // content sits on the same axis as the menu rows it replaces. Vertical is
+    // symmetric — the 16/14 this used to be was a 2px optical nudge nobody wrote
+    // down, and the token sweep turned it into 16/12, a nudge nobody chose.
+    margin_top: 16, margin_bottom: 16,
+    margin_start: rowInsetFor(RADIUS.lg) + GLASS_INSET, margin_end: rowInsetFor(RADIUS.lg) + GLASS_INSET,
     width_request: 210,
   })
   confirmBox.append(confirmIcon)
@@ -143,7 +159,7 @@ export function SystemMenuOverlay() {
 
   const squircleWrapper = SquircleContainer({
     child: pageHost,
-    radius: 24,
+    radius: RADIUS.lg,
     gloss: true,
     useShellOpacity: true,
     borderColor: { r: 1, g: 1, b: 1, a: 0.05 },

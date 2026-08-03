@@ -4,15 +4,13 @@
  * All components use pure GTK4 primitives + Nidara CSS tokens.
  * No Adwaita. No resets needed.
  *
- * Usage: import { NidaraSelect, NidaraOverlayManager } from "../../lib/nidara-kit"
+ * Usage: import { NidaraRow, NidaraScrolled } from "../../lib/nidara-kit"
  */
 
-// Overlay manager — for future floating UI (context menus, etc.)
-export { NidaraOverlayManager } from "./overlay-manager"
-
-// NidaraSelect — dropdown, no manager needed (uses Gtk.Popover)
-export type { SelectOption, NidaraSelectResult } from "./select"
-export { NidaraSelect } from "./select"
+// (NidaraSelect and NidaraOverlayManager were deleted 2026-08-03. The select was an
+// in-window overlay list; Settings moved to NidaraDropDown below because a real popover
+// is a separate Wayland surface and therefore gets compositor blur, which an overlay
+// cannot. The manager existed only to float that list, and went with it.)
 
 // NidaraClamp — max-width centering container (replaces Adw.Clamp)
 export { NidaraClamp } from "./clamp"
@@ -42,7 +40,7 @@ export { NidaraFontButton } from "./fontbutton"
 
 // NidaraRow / NidaraList — universal list row + boxed list card (the one place
 // a row/list is built; used by Settings, Control Center and any future surface)
-export { NidaraRow, NidaraStackedRow } from "./row"
+export { NidaraRow, NidaraStackedRow, ROW_H_SINGLE, ROW_H_DOUBLE } from "./row"
 export type { NidaraRowResult } from "./row"
 export { NidaraList } from "./list"
 export type { NidaraListResult } from "./list"

@@ -1,5 +1,6 @@
 import GLib from "gi://GLib"
 import { Gtk } from "ags/gtk4"
+import { RADIUS } from "../tokens"
 
 /**
  * NidaraScrolled — the shell's scroll view. One component for overlay surfaces AND
@@ -61,17 +62,27 @@ export interface NidaraScrolledOpts {
      *  grab without aiming, and it must stay >= that sum or the expanded pill would
      *  have to choose between leaving the lane and touching the surface edge. */
     lane?: number
-    /** Pad the child by `lane` so content never sits under the bar. Default true;
-     *  pass false when the caller's own CSS already reserves the lane. */
+    /** Pad the child by `lane` on BOTH sides. Default true — the fallback for content
+     *  with no inset of its own. Pass false whenever the content HAS one, or it pays
+     *  twice (a panel with a 6px halo ended up at 18). The content's inset does not have
+     *  to be as wide as the lane: what must clear the lane is a row's trailing CONTROL,
+     *  and that sits inside the row's own trailing padding — the pill floating over the
+     *  fill's last pixels is what an overlay scrollbar does everywhere. */
     reserveLane?: boolean
     /** Keep the bar permanently visible instead of fading after idle. */
     alwaysVisible?: boolean
     /** Corner radius, px, of the surface whose edge this view sits flush against —
-     *  the token, not a guess: `--nidara-radius-lg` 24 for a window, `-md` 16 for a
-     *  card, 20 for a bar-expansion capsule. It sets how far the pill stops short of
+     *  the token, not a guess: `RADIUS.lg` (24) for a window and for a bar-expansion
+     *  capsule, `RADIUS.md` (16) for a card. It sets how far the pill stops short of
      *  the ends so a rounded corner cannot clip it. Default 0 = square edge, or a
      *  view that does not reach the surface's own edge. */
     cornerRadius?: number
+    /** How far the view is ALREADY indented from that corner, px — a panel that pads
+     *  its content has spent part of the clearance already, and without this the
+     *  corner allowance double-counts and the pill floats in dead space. Measure from
+     *  the VISIBLE glass edge (a Cairo `SquircleContainer` insets its shape 2px from
+     *  the widget rect). Default 0 = the view starts at the corner. */
+    cornerInset?: number
     /** Extra classes on the ScrolledWindow. */
     cssClasses?: string[]
 }
@@ -99,19 +110,35 @@ const CORNER_CLEAR = 4
 const EDGE_CLEAR = 4
 
 /**
- * How much height a corner of radius `r` eats at the pill's distance from the wall.
+ * Where the pill may start, given a corner of radius `r` and how far the view
+ * already sits inside that corner.
  *
  * A rounded corner clips whatever is drawn inside its arc, and the pill runs at
  * EDGE_CLEAR from the trailing wall, so the arc reaches
- * `r - sqrt(r² - (r - EDGE_CLEAR)²)` px in from the end of the lane. 4px covers a
- * card (radius-sm/md) and is wrong for a window: `glass(floating)` is radius-lg =
- * 24px, which eats 10.7px — reported as the Settings bar being cut off at the bottom.
- * Ceiled, and never below the 4px floor, which is also the value for a square edge.
+ * `r - sqrt(r² - (r - EDGE_CLEAR)²)` px in from the end of the lane — 10.7px for a
+ * radius-lg (24) corner, which is what cut off the Settings bar at the bottom.
+ *
+ * ⚠️ That expression is the point of TANGENCY, not a clearance: stopping exactly
+ * there leaves the pill's corner kissing the curve. It read as fine on windows only
+ * because a window's visible corner is drawn by Hyprland at `rounding_power 3.2` —
+ * a SQUIRCLE, which is squarer than a circle and leaves slack the maths never
+ * promised. Against a true circular arc there is none, and you see it: the bar
+ * expansion panel paints with `perfect: true` (real arcs, see drawSquircle) and
+ * going radius 20 → 24 in the token audit put the clipboard pill 1.27px off the
+ * curve — user-reported, 2026-08-03. So the pill keeps CORNER_CLEAR from the curve
+ * exactly as it keeps EDGE_CLEAR from the wall: one rule, every boundary.
+ *
+ * `inset` is what the VIEW is already indented from that corner (a panel that pads
+ * its content, e.g. the bar expansion's 10px minus the 2px glass inset = 8). Without
+ * it the clearance double-counts and the pill floats in dead space.
  */
-const cornerClearFor = (r: number) =>
+const cornerClearFor = (r: number, inset = 0) =>
     r <= EDGE_CLEAR
         ? CORNER_CLEAR
-        : Math.max(CORNER_CLEAR, Math.ceil(r - Math.sqrt(r * r - (r - EDGE_CLEAR) ** 2)))
+        : Math.max(
+            CORNER_CLEAR,
+            Math.ceil(r - Math.sqrt(r * r - (r - EDGE_CLEAR) ** 2)) + CORNER_CLEAR - inset,
+        )
 
 /** Vertical pill, in the lane's own coordinates. */
 function pillPath(cr: any, x: number, y: number, w: number, h: number) {
@@ -139,8 +166,8 @@ export function NidaraScrolled(opts: NidaraScrolledOpts): NidaraScrolledResult {
     // BOTH sides, not just the trailing one. Padding only where the bar sits buys the
     // hit protection and loses the symmetry: a row's hover/selected fill then ends
     // `lane` px from one wall and flush against the other, which is what the sidebar
-    // made obvious. Content that already has an inset wide enough to hold the lane
-    // passes reserveLane: false and keeps its own (that is the preferred shape).
+    // made obvious. Content that has its own inset passes reserveLane: false and keeps
+    // it — that is the preferred shape, and the inset need not be as wide as the lane.
     if (opts.reserveLane ?? true) {
         opts.child.margin_start = (opts.child.margin_start || 0) + lane
         opts.child.margin_end = (opts.child.margin_end || 0) + lane
@@ -152,6 +179,7 @@ export function NidaraScrolled(opts: NidaraScrolledOpts): NidaraScrolledResult {
             lane,
             alwaysVisible: opts.alwaysVisible,
             cornerRadius: opts.cornerRadius,
+            cornerInset: opts.cornerInset,
         }),
         scrolled,
     }
@@ -165,11 +193,11 @@ export function NidaraScrolled(opts: NidaraScrolledOpts): NidaraScrolledResult {
  */
 export function attachScrollBar(
     scrolled: Gtk.ScrolledWindow,
-    opts: { lane?: number, alwaysVisible?: boolean, cornerRadius?: number } = {},
+    opts: { lane?: number, alwaysVisible?: boolean, cornerRadius?: number, cornerInset?: number } = {},
 ): Gtk.Widget {
     const lane = opts.lane ?? 12
     const alwaysVisible = opts.alwaysVisible ?? false
-    const cornerClear = cornerClearFor(opts.cornerRadius ?? 0)
+    const cornerClear = cornerClearFor(opts.cornerRadius ?? 0, opts.cornerInset ?? 0)
     // EXTERNAL, always: the point is that GTK never creates a scrollbar widget, so
     // there is no node left to grow toward the pointer.
     scrolled.vscrollbar_policy = Gtk.PolicyType.EXTERNAL
@@ -375,7 +403,7 @@ export function attachScrollBar(
  */
 export function adoptGtkScrolled(
     scrolled: Gtk.ScrolledWindow,
-    opts: { lane?: number, alwaysVisible?: boolean } = {},
+    opts: { lane?: number, alwaysVisible?: boolean, cornerRadius?: number, cornerInset?: number } = {},
 ): boolean {
     const parent = scrolled.get_parent() as Gtk.Box | null
     if (!parent || !(parent instanceof Gtk.Box)) return false
@@ -425,7 +453,55 @@ function dropDownScroller(drop: Gtk.Widget): Gtk.ScrolledWindow | null {
  */
 export function NidaraDropDown(props: any = {}): Gtk.DropDown {
     const drop = new Gtk.DropDown(props)
+
+    // Our own LIST factory (the button keeps GTK's default one, via `list-factory` rather
+    // than `factory`), and the row we hand it CARRIES THE FILL — `.nidara-dropdown-item`,
+    // not GTK's `row` node.
+    //
+    // Why: GTK's default factory puts a CHECKMARK in every item (an 18px icon plus 4px of
+    // spacing, 22px of the popover's width), and a fill of ours cannot sit on a node that
+    // also carries GTK's own. So the fill moves onto a widget we own: `> row` is stripped
+    // to nothing in _components.scss and this box hexpands into it, which is the same
+    // shape as every other list in the shell (MenuRow, NidaraRow) — none of which is a
+    // GtkListView.
+    //
+    // ⚠️ The reason first written here — that GTK's item box is inset inside its list by
+    // 6/24 and is always 30px narrower, whatever the factory — does NOT reproduce.
+    // Offscreen, with GTK's factory and with ours, the item is exactly the ListView's
+    // content rect: `FACTORY=gtk|nidara scripts/dev/gtk-probe.js`. Keep the swap for the
+    // checkmark and for owning the fill, not for a phantom inset.
+    const factory = new Gtk.SignalListItemFactory()
+    factory.connect("setup", (_f: any, item: any) => {
+        const label = new Gtk.Label({ xalign: 0, hexpand: true, halign: Gtk.Align.FILL })
+        const row = new Gtk.Box({
+            css_classes: ["nidara-dropdown-item"],
+            hexpand: true, halign: Gtk.Align.FILL,
+        })
+        row.append(label)
+        item.set_child(row)
+    })
+    factory.connect("bind", (_f: any, item: any) => {
+        const obj: any = item.get_item()
+        const label: any = item.get_child()?.get_first_child()
+        if (label) label.label = obj?.string ?? obj?.get_string?.() ?? String(obj ?? "")
+    })
+    drop.list_factory = factory
+
     const sw = dropDownScroller(drop)
-    if (sw) adoptGtkScrolled(sw)
+    // The popover's contents box carries no padding and the list insets only its SIDES
+    // (_components.scss), so this viewport runs flush into the card top and bottom — which
+    // is where the bar lives. `cornerInset: 0`: the view starts AT the corner vertically,
+    // so the pill has to keep the whole arc's clearance (a radius-16 corner reaches
+    // ~10.6px in at the trailing wall) instead of counting an indent it no longer has.
+    //
+    // ⚠️ Why the vertical inset is gone at all, so nobody puts it back: `GtkListView` is a
+    // `GtkScrollable`, so a ScrolledWindow gives it the card directly — no `GtkViewport`.
+    // A vertical margin (or padding — measured, identical) therefore shrinks the PAGE, and
+    // the content gets clipped at the inset instead of at the card's edge: a dead band the
+    // rows disappear into. Everywhere else in the shell the list is not scrollable itself,
+    // sits in a viewport, and its padding scrolls away with the content. Wrapping this list
+    // in a viewport to get that back would cost the ListView's recycling AND GTK's
+    // open-at-the-selected-item scroll, which both depend on it owning the adjustments.
+    if (sw) adoptGtkScrolled(sw, { cornerRadius: RADIUS.md, cornerInset: 0 })
     return drop
 }

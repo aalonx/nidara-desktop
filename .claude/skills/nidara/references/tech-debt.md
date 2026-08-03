@@ -2037,30 +2037,76 @@ Not a bug list — conscious tradeoffs to pay down opportunistically:
 3. **Don't refactor as a side-effect of an unrelated change** — drive-by fixes tend to be
    partial and create drift.
 
-### 47. The design tokens drifted — spacing and radii are several ladders, not one (2026-08-03) — NEXT SESSION
-Raised by the user while reviewing the scroll bar: *"parece que hemos puesto un valor distinto
-cada vez que hemos hecho algo, y ahora no cuadra en todos los sitios"* — and the specific catch
-was the bar-expansion capsule at radius **20** while windows are **24**. Correct on both counts.
-Measured, so the audit starts from data rather than a re-scan:
+### 47. Design-token audit — CLOSED for `ui/shell` (2026-08-03)
+Raised by the user reviewing the scroll bar: *"parece que hemos puesto un valor distinto cada
+vez que hemos hecho algo"* — the specific catch was the bar-expansion capsule at radius **20**
+while windows are **24**. Correct.
 
-**Radii — two unrelated ladders.** The CSS tokens are `xs 6 / sm 10 / md 16 / lg 24` (already
-not a clean 4-step: 6 and 10 are half-steps). The Cairo literals passed to
-`SquircleContainer`/`drawSquircle` are a *different* set — `16 / 20 / 24 / 32 / 64` — and two of
-them have **no token at all**: `20` in `surfaces/bar/Bar.tsx` (the expansion capsule, i.e. the
-clipboard/battery/screenshot panels) and `surfaces/control-center/CCContextMenu.tsx`. `24` in
-`SystemMenu.tsx` + `IslandGrid.tsx`, `32` in nine places (all four islands, NC capsules, app
-grid, Prism, BaseIsland), `64` in `WorkspaceOverview.tsx`, `16` in one NC header.
+**✅ Radii — closed, TS/TSX *and* SCSS.** One ladder in `ui/lib/tokens.ts` mirrored by
+`--nidara-radius-*`; **zero radius literals in `ui/shell`** (`64 → 32` Workspace Overview,
+`20 → 24` bar expansion + CC context menu, `18 → md` app-grid tiles, `14 → md` popover,
+`12 → md` ws-strip tile, `8 → xs` calendar cell, new `xl: 32`). Two literals turned out to be
+**stadiums, not rungs** (`pill`, no pixels changed), and two entries were rounding nothing and
+were deleted: the `--nidara-radius-squircle: 28%` token (zero consumers, ever) and
+`.prism-result-icon` (`border-radius` on a background-less `Gtk.Image`). Rationale — why the
+ladder is deliberately NOT on the 4px spacing scale, why `sm` is derived from the card inset,
+and the stadium rule — is in `design-system.md` under "Radii — ONE ladder".
 
-**Spacing — the 4px scale (`$space-1..10`, `_base.scss:133`) is declared but not enforced.**
-Off-scale pixel values in `styles/*.scss`, by frequency: `6px` ×20, `14px` ×11, `10px` ×8,
-`7px` ×4, `5px` ×7, `3px` ×7, `18px` ×2, `22px` ×2. (`1px`/`2px` ×14 are legitimate hairlines
-and borders — exclude them.) Note the shape of the offenders: almost all are *a multiple of 4
-plus 2*, i.e. a half-step that crept in one component at a time. `14` in particular is load-
-bearing right now — it is `Bar.tsx`'s expansion inset and `PANEL_PAD` in `widgets/clipboard.ts`,
-which must move together.
+**✅ Spacing — closed.** SCSS margins (8 of 43 off-scale) in the first pass; then the TSX side,
+**164 off-scale values down to 4**, all derived and commented; then SCSS container padding.
+The structural fix underneath it: **row heights are declared** (48 one-line / 72 two-line via
+`min-height` on the kit component's own classes, which is why the same row measured 43px on
+Network and 47px on Appearance), and container padding sits on three tiers — dense panel 8/12,
+window row 12/16, island 16/20.
 
-**Scope for the audit:** decide one radius ladder that covers both CSS and Cairo (the Cairo
-sizes are large surfaces, the CSS ones are controls — they may legitimately be two *named*
-tiers of one scale, but they must be named and shared, not literals); then sweep the off-scale
-spacing. Do it as a single pass with the user, not opportunistically — the values are currently
-consistent *with each other* in several places, so half a sweep is worse than none.
+**The rule that governs any future sweep here: the token for a control is the HEIGHT (24 compact
+/ 32 control / ~48 row), not the padding.** `nidara-kit/row.ts`'s `margin_top/bottom: 14` is
+what lands a `$fs-small` row at 48; `button.nidara-btn`'s `padding: 5px 14px` and the alert
+footer's `14px` are the same shape; the switch's `slider { margin: 3px }` is (24 trough − 18
+slider)/2. Snapping those to the 4px scale resizes the shell instead of tidying it.
+
+Untouched on purpose and still correct: optical nudges on text (`_bar.scss` `margin-top: 5px`,
+`.rec-elapsed-big` 6/2), derived sizes (`.accent-circle-btn` 30 = 24 swatch + 3+3 border), and
+alignment axes (Prism's `22`).
+
+**What is genuinely left:**
+- **The bar capsule** — `Bar.tsx`'s `margin 14` and `_bar.scss`'s `padding: 6px 14px` are one
+  unit; they move together or not at all, and moving them changes the bar's height.
+- **The greeter and lockscreen bundles**, which carry standalone stylesheets that never import
+  the token layer (11 literal paddings, 1 literal radius). Not reachable from `ui/shell`'s
+  tokens without giving those bundles the scale first — and only verifiable in a VM.
+
+### 48. Art rounding is three unrelated numbers (2026-08-03)
+Found while closing #47, and deliberately NOT swept with it (see rule 3 above — don't refactor as
+a side-effect). The radius ladder governs container corners; **rounding a bitmap is a different
+job**, done in Cairo by `squircleThumb(pixbuf, w, h, radius, cssClass)` because GTK4's
+`border-radius` does not clip a child's rendering. Those radii are art proportions, not rungs —
+but right now they do not agree with each other either:
+
+- `widgets/clipboard.ts` — `THUMB_RADIUS 8` on a 32px thumb = **25 %**, the macOS icon ratio.
+- `NotificationCenter.tsx:75` — `12` on a hero whose `size` is a **parameter**, so the ratio
+  changes with the caller.
+- `NotificationCenter.tsx:103` — `16` on the big hero, width and height variable.
+
+The likely answer is one exported ratio (~25 %) applied to the art's short side, with a floor so
+a small thumb does not go nearly-circular. Low priority: it is visible only on notification art
+and clipboard image rows, and changing it moves how every notification looks — worth doing when
+something else is already touching that surface.
+
+### 49. The bubble menu is copy-pasted three times (2026-08-03)
+`DockItem.tsx`, `AppGrid.tsx` and `widgets/media.ts` each build the same popover by hand:
+`new Gtk.Popover` → `Gtk.Grid` → a `DrawingArea` painted by `paintGlassBubble(…, { radiusMax: 16 })`
+→ a `nidara-menu` rows `Gtk.Box` → a `Theme.connect("changed")` redraw (plus its disconnect
+bookkeeping) → `set_child`/`set_parent` → `sideFor(position)` for the arrow side → a layout
+function putting `BUF + PAD (+ ARROW_H on the arrow side)` on four margins.
+
+**The evidence it should be one component: the `PAD` line had to be hand-edited in all three files**
+when the dense-panel halo became `rowInsetFor()`. Nothing links them, so a fourth bubble menu would
+start from a copy of whichever one its author found first.
+
+The extraction is `GlassBubbleMenu({ anchor, position, buildRows })` in `ui/shell/common/` (shell,
+not the kit — it needs `Theme` and `GlassBubble`). What differs per call site and has to stay
+parametric: when the rows are rebuilt (dock and app grid rebuild per show, media on source change),
+whether the side is recomputed on move, and the destroy-time signal cleanup. Deliberately NOT done
+inside the token audit — refactoring three interactive surfaces belongs on its own branch with its
+own live check (rule 3 at the top of this file).

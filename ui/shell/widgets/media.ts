@@ -15,6 +15,7 @@ import Theme from "../core/ThemeManager"
 import { attachTooltip } from "../common/Tooltip"
 import { menuRow, menuSeparator } from "../common/MenuRow"
 import { sideFor, paintGlassBubble, ARROW_H, BUF, type ArrowSide } from "../common/GlassBubble"
+import { RADIUS, rowInsetFor } from "../../lib/tokens"
 
 // NO bar variant. The Activity Island already carries the player as an activity
 // (IslandActivities' mediaActivity: cover art in the compact capsule the moment
@@ -92,7 +93,7 @@ export function buildMediaDetailPanel(widthRequest: number): Gtk.Widget {
     const ctrlBox = new Gtk.Box({ spacing: 12, halign: Gtk.Align.CENTER, hexpand: true })
     ctrlBox.append(prev); ctrlBox.append(play); ctrlBox.append(next)
 
-    const textBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 3, valign: Gtk.Align.CENTER, hexpand: true })
+    const textBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 2, valign: Gtk.Align.CENTER, hexpand: true })
     textBox.append(titleLabel)
     textBox.append(artistLabel)
 
@@ -126,7 +127,7 @@ export function buildMediaDetailPanel(widthRequest: number): Gtk.Widget {
         srcPopover.set_has_tooltip(false)
         const grid = new Gtk.Grid()
         srcDraw = new Gtk.DrawingArea({ hexpand: true, vexpand: true, halign: Gtk.Align.FILL, valign: Gtk.Align.FILL })
-        srcDraw.set_draw_func((_da, cr, w, h) => paintGlassBubble(cr, w, h, srcSide, { radiusMax: 16 }))
+        srcDraw.set_draw_func((_da, cr, w, h) => paintGlassBubble(cr, w, h, srcSide, { radiusMax: RADIUS.lg, n: 3.2 }))
         grid.attach(srcDraw, 0, 0, 1, 1)
         srcRows = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, css_classes: ["nidara-menu"] })
         grid.attach(srcRows, 0, 0, 1, 1)
@@ -137,7 +138,8 @@ export function buildMediaDetailPanel(widthRequest: number): Gtk.Widget {
 
     const layoutSourceMenu = () => {
         if (!srcRows) return
-        const PAD = 5   // interior padding between the glass edge and the rows
+        // Same halo and silhouette as every other menu of rows (lg squircle + arrow).
+        const PAD = rowInsetFor(RADIUS.lg)
         srcRows.margin_top    = BUF + PAD + (srcSide === "top"    ? ARROW_H : 0)
         srcRows.margin_bottom = BUF + PAD + (srcSide === "bottom" ? ARROW_H : 0)
         srcRows.margin_start  = BUF + PAD + (srcSide === "left"   ? ARROW_H : 0)
@@ -230,7 +232,7 @@ export function buildMediaDetailPanel(widthRequest: number): Gtk.Widget {
 
     const root = new Gtk.Box({
         orientation: Gtk.Orientation.VERTICAL, spacing: 12, hexpand: true,
-        margin_top: 6, margin_bottom: 6, margin_start: 6, margin_end: 6,
+        margin_top: 8, margin_bottom: 8, margin_start: 8, margin_end: 8,
     })
     if (widthRequest > 0) root.set_size_request(widthRequest, -1)
     // Order: artwork+title → progress (with times) → transport controls.

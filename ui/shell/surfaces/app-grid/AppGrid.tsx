@@ -13,6 +13,7 @@ import { t } from "../../core/i18n"
 import Icons from "../../core/Icons"
 import { ScaleRevealer, OVERLAY_POP } from "../../common/ScaleRevealer"
 import SquircleContainer from "../../common/SquircleContainer"
+import { RADIUS, rowInsetFor } from "../../../lib/tokens"
 import Theme from "../../core/ThemeManager"
 import Cairo from "gi://cairo"
 import shellActions from "../../core/ShellActions"
@@ -49,7 +50,7 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
     })
     const searchBox = new Gtk.Box({
         css_classes: ["app-grid-search-box"],
-        spacing: 10,
+        spacing: 12,
         hexpand: true,
     })
     searchBox.append(new Gtk.Image({ gicon: Icons.search, pixel_size: 18, css_classes: ["app-grid-search-icon", "nd-icon"] }))
@@ -268,7 +269,7 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
 
     const squirclePanel = SquircleContainer({
         child: contentBox,
-        radius: 32,
+        radius: RADIUS.xl,
         gloss: true,
         useShellOpacity: true,
         inset: 2.0,
@@ -369,7 +370,7 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
 
         const item = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
-            spacing: 10,
+            spacing: 12,
             css_classes: ["app-grid-item"],
             halign: Gtk.Align.CENTER,
             valign: Gtk.Align.START,
@@ -412,7 +413,7 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
                 hexpand: true, vexpand: true,
                 halign: Gtk.Align.FILL, valign: Gtk.Align.FILL,
             })
-            menuDraw.set_draw_func((_da, cr, w, h) => paintGlassBubble(cr, w, h, menuSide, { radiusMax: 16 }))
+            menuDraw.set_draw_func((_da, cr, w, h) => paintGlassBubble(cr, w, h, menuSide, { radiusMax: RADIUS.lg, n: 3.2 }))
             grid.attach(menuDraw, 0, 0, 1, 1)
 
             menuRows = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, css_classes: ["nidara-menu"] })
@@ -427,7 +428,10 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
 
         const layoutMenu = () => {
             if (!menuRows) return
-            const PAD = 5  // interior padding between the glass edge and the rows
+            // Same halo and silhouette as every other menu of rows (system menu, CC
+            // context menu, bar panels): lg squircle body, arrow spliced in. The row's
+            // hover fill spans this box, so this margin is the fill's own halo.
+            const PAD = rowInsetFor(RADIUS.lg)
             menuRows.margin_top    = BUF + PAD + (menuSide === "top"    ? ARROW_H : 0)
             menuRows.margin_bottom = BUF + PAD + (menuSide === "bottom" ? ARROW_H : 0)
             menuRows.margin_start  = BUF + PAD + (menuSide === "left"   ? ARROW_H : 0)

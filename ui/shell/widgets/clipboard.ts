@@ -3,9 +3,11 @@ import Gio from "gi://Gio"
 import GLib from "gi://GLib"
 import GdkPixbuf from "gi://GdkPixbuf"
 import { squircleThumb } from "../common/DrawingUtils"
+import { GLASS_INSET } from "../common/SquircleContainer"
 import { menuRow, menuSeparator } from "../common/MenuRow"
 import IconButton from "../common/IconButton"
 import { NidaraScrolled } from "../../lib/nidara-kit"
+import { RADIUS, rowInsetFor } from "../../lib/tokens"
 import { PANEL_W } from "../common/widget-kit"
 import { AtomicWidget, WidgetSize } from "../surfaces/control-center/Types"
 import { buildCapsuleInner, wrapCapsuleTile } from "../surfaces/control-center/Toggles"
@@ -66,10 +68,18 @@ const BINARY_PREVIEW = /^\[\[ binary data \S+ \S+ (\w+) (\d+)x(\d+) \]\]$/
 // here is a safety net for a hand-edited limit, not the product decision.
 const MAX_ROWS = 200
 
-// What Bar.tsx gives every other expansion panel. We take it over (barExpandedFlush)
-// so the scroll can reach the panel edge, then re-apply it to the content — keep the
-// two in step or this panel drifts from every other one.
-const PANEL_PAD = 14
+// What Bar.tsx gives every other expansion panel. We take the HORIZONTAL over
+// (barExpandedFlush) so the scroll can reach the panel edge, then re-apply it to the
+// content. Flush leaves the box at GLASS_INSET, so this is measured from the glass —
+// which is what rowInsetFor() already means. Default `n`: the panel is a squircle, like
+// every other floating popup of the shell.
+const PANEL_PAD = rowInsetFor(RADIUS.lg)
+
+// How far this panel's content already starts inside the capsule's VISIBLE corner —
+// the vertical margin Bar.tsx keeps on `expansionInner` even when flush, measured from
+// the widget rect, less the glass that SquircleContainer paints inside it. Feeds the
+// scroll's corner clearance; it moves with Bar.tsx, so derive it, never copy it.
+const PANEL_TOP_INSET = rowInsetFor(RADIUS.lg)
 
 async function listEntries(): Promise<ClipEntry[]> {
     try {
@@ -301,7 +311,7 @@ function buildClearFooter(refresh: () => void): Gtk.Widget {
         host.append(child)
     }
 
-    const confirmRow = new Gtk.Box({ spacing: 6, homogeneous: true })
+    const confirmRow = new Gtk.Box({ spacing: 8, homogeneous: true })
     const cancelBtn = new Gtk.Button({
         label: t("widget.clipboard.clear.cancel"),
         css_classes: ["nidara-menu-row", "nidara-confirm-secondary"], hexpand: true,
@@ -338,10 +348,13 @@ function buildClipboardContent(onClose: () => void): Gtk.Widget {
     // NidaraScrolled, not Gtk.ScrolledWindow: every row carries a ✕ at its right
     // edge, and GTK's overlay slider grows toward the pointer as it approaches,
     // eating that button's hit area (tech-debt #15).
-    // barExpandedFlush: the scroll reaches the panel's inner edge so the bar sits
-    // there, per the shell-wide rule. The 14px the panel used to give us moves onto
-    // the CONTENT — and the bar's 12px lane fits inside that inset, so an expanded
-    // pill still never reaches a row's ✕. reserveLane off: the inset already is one.
+    // barExpandedFlush: the scroll reaches the panel's inner edge so the bar sits there,
+    // per the shell-wide rule, and the panel's own inset moves onto the CONTENT.
+    // reserveLane off: the lane lives in that inset. It is WIDER than the inset (12 vs the
+    // halo's 6) and that is fine — what has to clear the lane is the row's trailing
+    // CONTROL, not its fill: the ✕ sits inside `.nidara-menu-row`'s 12px trailing padding,
+    // so its edge lands 18px in, past the 12px lane. The pill floats over the fill's last
+    // pixels, which is what an overlay scrollbar does everywhere.
     list.margin_start = PANEL_PAD
     list.margin_end = PANEL_PAD
     const { widget: scroll } = NidaraScrolled({
@@ -351,6 +364,14 @@ function buildClipboardContent(onClose: () => void): Gtk.Widget {
         minContentHeight: 60,
         maxContentHeight: 360,
         widthRequest: PANEL_W.xl + PANEL_PAD * 2,
+        // This scroll is the panel's first child, so its top runs into the panel's corner:
+        // PANEL_TOP_INSET is how far in it already starts, and the rest of the clearance is
+        // the kit's. `cornerRadius` is the panel's radius as if the corner were CIRCULAR —
+        // it is a squircle now (Bar.tsx dropped `perfect: true`), which reaches into its
+        // corner far less, so this over-reserves. Deliberate: over-reserving moves the pill
+        // a couple of px inward, under-reserving puts it on the curve, and that was the bug.
+        cornerRadius: RADIUS.lg,
+        cornerInset: PANEL_TOP_INSET,
     })
 
     const sep = menuSeparator()

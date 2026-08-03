@@ -8,7 +8,8 @@ import { MorphRevealer } from "../../common/MorphRevealer"
 import Cairo from "gi://cairo"
 import Gio from "gi://Gio"
 
-import SquircleContainer from "../../common/SquircleContainer"
+import SquircleContainer, { GLASS_INSET } from "../../common/SquircleContainer"
+import { RADIUS, rowInsetFor } from "../../../lib/tokens"
 import { CAPSULE_BORDER } from "./capsule"
 import Theme from "../../core/ThemeManager"
 import appService from "../../core/AppService"
@@ -101,13 +102,28 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
   // Measurement cache — populated after first layout; used to cap visible icons
   let cachedMaxIcons: number | null = null
   const capsuleRefs = new Map<string, Gtk.Widget>()
-  const expansionInner = new Gtk.Box({ margin_top: 10, margin_bottom: 10, margin_start: 14, margin_end: 14 })
+  // The halo of the row hover fill, from the GLASS, all four sides (the horizontal is
+  // re-applied per panel below, since a flush panel takes it over). Default `n` — this
+  // panel is a squircle like every other floating popup of the shell, so 6. See
+  // rowInsetFor in tokens.ts.
+  const expansionInner = new Gtk.Box({
+      margin_top: rowInsetFor(RADIUS.lg) + GLASS_INSET, margin_bottom: rowInsetFor(RADIUS.lg) + GLASS_INSET,
+      margin_start: rowInsetFor(RADIUS.lg) + GLASS_INSET, margin_end: rowInsetFor(RADIUS.lg) + GLASS_INSET,
+  })
   // Pop animation (grow toward the anchor + fade) shared by every overlay —
   // the wrapper is the variable, so all the existing alignment/margin/region
   // code below operates on it transparently (animateLayout:false = Gtk.Bin).
+  // NOT `perfect: true`, deliberately. Every other `perfect` in this file is a bar
+  // CAPSULE — 40px tall, where it is what clamps the corner to min(w,h)/2 and makes the
+  // stadium. This panel is the only large surface that had inherited it, and at radius lg
+  // it bought nothing but a circular corner: a different shape from the system menu, the
+  // CC context menu and the CC detail island, which are the same family (`lg` = "any
+  // floating popup of the shell"). A squircle also does not reach into its own corner, so
+  // the halo above drops from 14 to 6 — the reason this panel read airy next to a menu
+  // sitting right under it.
   const expansionCapsule = new ScaleRevealer(SquircleContainer({
       child: expansionInner, gloss: true, useShellOpacity: true,
-      borderColor: { r: 1, g: 1, b: 1, a: 0.2 }, perfect: true, radius: 20,
+      borderColor: { r: 1, g: 1, b: 1, a: 0.2 }, radius: RADIUS.lg,
       css_classes: ["bar-expansion-panel"],
   }), { ...OVERLAY_POP, pivot: "top-center" })   // grows down from its bar capsule
   expansionCapsule.valign = Gtk.Align.START
@@ -458,8 +474,12 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
       }
       // A flush panel reaches the capsule's inner edge horizontally (its scroll bar
       // has to live there); it keeps the vertical breathing room either way.
-      expansionInner.margin_start = flush ? 0 : 14
-      expansionInner.margin_end = flush ? 0 : 14
+      // GLASS_INSET, not 0: the capsule's VISIBLE edge is that far inside its own
+      // allocation (drawSquircle paints the glass in from the rect), so flush-to-rect
+      // hangs the content outside the shape — and puts a scroll lane's pill 2px nearer
+      // the curve than its clearance assumes, which is what clipped the clipboard bar.
+      expansionInner.margin_start = flush ? GLASS_INSET : rowInsetFor(RADIUS.lg) + GLASS_INSET
+      expansionInner.margin_end = flush ? GLASS_INSET : rowInsetFor(RADIUS.lg) + GLASS_INSET
       // Direct pill→pill switch (one click, no dismissal in between): the
       // capsule is still fully revealed at the PREVIOUS anchor's position, so
       // snap it to the hidden state first — otherwise the new content paints
@@ -626,7 +646,7 @@ export default function Bar(gdkmonitor: Gdk.Monitor) {
       if (!w) continue
       const hasExpand = !!w.buildBarExpanded
       const hasCCDetail = !!w.buildCCDetail
-      const row = new Gtk.Box({ spacing: 10 })
+      const row = new Gtk.Box({ spacing: 12 })
       row.append(new Gtk.Image({ gicon: w.icon, pixel_size: 16, css_classes: ["nd-icon"] }))
       row.append(new Gtk.Label({ label: w.name, halign: Gtk.Align.START, hexpand: true }))
       const btn = new Gtk.Button({ child: row, css_classes: ["nidara-menu-row"], hexpand: true })
