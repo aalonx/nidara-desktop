@@ -17,6 +17,17 @@ export { NidaraSelect } from "./select"
 // NidaraClamp — max-width centering container (replaces Adw.Clamp)
 export { NidaraClamp } from "./clamp"
 
+// NidaraScrolled — scroll view whose indicator can never take a click (replaces
+// Gtk.ScrolledWindow wherever rows carry a control at their right edge)
+export type { NidaraScrolledOpts, NidaraScrolledResult } from "./scrolled"
+export { NidaraScrolled } from "./scrolled"
+
+// NidaraDropDown — Gtk.DropDown whose popup list carries the same bar. The native
+// dropdown stays (its popover is a real Wayland popup, so it gets compositor blur);
+// what goes is GTK's scrollbar inside it. attachScrollBar/adoptGtkScrolled are the
+// same machinery for any other view GTK builds for us.
+export { NidaraDropDown, attachScrollBar, adoptGtkScrolled } from "./scrolled"
+
 // NidaraSplitView — sidebar+content with auto-collapse (replaces Adw.OverlaySplitView + Adw.Breakpoint)
 export type { NidaraSplitViewResult } from "./split-view"
 export { NidaraSplitView } from "./split-view"
@@ -41,7 +52,7 @@ export { NidaraSidebar } from "./sidebar"
 export type { NidaraSidebarItem, NidaraSidebarResult } from "./sidebar"
 
 // NidaraWindow — settings-style window shell (glass + split + reparenting header)
-export { NidaraWindow } from "./window"
+export { NidaraWindow, NIDARA_WINDOW_RADIUS, NIDARA_CARD_RADIUS } from "./window"
 export type { NidaraWindowOpts, NidaraWindowResult } from "./window"
 
 // showNidaraAlert — modal confirmation dialog (replaces Adw.AlertDialog)

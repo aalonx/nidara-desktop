@@ -1,6 +1,17 @@
 import { Gtk } from "ags/gtk4"
 import Gio from "gi://Gio"
+import { NidaraScrolled } from "./scrolled"
 import { NidaraSplitView, type NidaraSplitViewResult } from "./split-view"
+
+/**
+ * Chrome radii as numbers, mirroring the CSS tokens: the window is `glass(floating)`
+ * = `--nidara-radius-lg`, the sidebar capsule is `material-card` = `--nidara-radius-md`.
+ * They live here because Cairo and NidaraScrolled's geometry cannot read a CSS var —
+ * a corner that clips has to be known in px. Move these if the tokens move; the
+ * duplication is on the list for the design-token audit (tech-debt #47).
+ */
+export const NIDARA_WINDOW_RADIUS = 24
+export const NIDARA_CARD_RADIUS = 16
 
 export interface NidaraWindowOpts {
     app: any
@@ -75,13 +86,28 @@ export function NidaraWindow(opts: NidaraWindowOpts): NidaraWindowResult {
     if (name) win.set_name(name)
 
     // ── Sidebar capsule (toolbar on top, scrolling list below) ────────────────
-    const sidebarScroll = new Gtk.ScrolledWindow({
-        hscrollbar_policy: Gtk.PolicyType.NEVER,
-        vscrollbar_policy: Gtk.PolicyType.AUTOMATIC,
-        css_classes: ["nidara-window-sidebar-scroll"],
-        vexpand: true,
+    // NidaraScrolled, like every other scroll view in the DE — a window's sidebar is
+    // not an exception to the rule (design-system.md, "Any ScrolledWindow — windows
+    // included"). It was the last GTK scrollbar left inside a Nidara window, sitting
+    // two panes away from ours and looking like a different component.
+    // reserveLane: false because `.nidara-sidebar` carries the inset itself, 12px on
+    // BOTH sides. Reserving it here instead added the lane to the list's own 6px
+    // padding on one side only, so a row's hover/selected fill sat 18px from the
+    // right edge and 6px from the left — the user spotted it immediately, and a
+    // sidebar is where it shows most (narrow capsule, high-contrast selection).
+    const { widget: sidebarScrollWidget, scrolled: sidebarScroll } = NidaraScrolled({
+        child: sidebar,
+        reserveLane: false,
+        // Flush with the capsule's rounded bottom, so the pill stops short of it.
+        cornerRadius: NIDARA_CARD_RADIUS,
+        cssClasses: ["nidara-window-sidebar-scroll"],
     })
-    sidebarScroll.set_child(sidebar)
+    sidebarScroll.vexpand = true
+    sidebarScrollWidget.vexpand = true
+    // Gap to the search slot above. It lives on the OVERLAY, not on the view: the
+    // bar spans the overlay, so a margin on the view alone would leave the lane 4px
+    // taller than the viewport it maps to and the thumb would drift from the content.
+    sidebarScrollWidget.margin_top = 4
 
     const sidebarColumn = new Gtk.Box({
         orientation: Gtk.Orientation.VERTICAL,
@@ -94,7 +120,7 @@ export function NidaraWindow(opts: NidaraWindowOpts): NidaraWindowResult {
         topSlot.append(sidebarTop)
         sidebarColumn.append(topSlot)
     }
-    sidebarColumn.append(sidebarScroll)
+    sidebarColumn.append(sidebarScrollWidget)
 
     // ── Sidebar toggle ────────────────────────────────────────────────────────
     const sidebarToggle = new Gtk.Button({
