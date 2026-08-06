@@ -2454,3 +2454,66 @@ Neither is a focus-grab quirk as such — they are what the catcher had been hid
 
 **Do not migrate the dock's own menus.** They are popovers by design (the `#14` glass rows), so they
 are the *other* side of the slot collision, not a candidate.
+
+### 54. ✅ CLOSED — the overview's tile geometry was STALE while its capture was FRESH (2026-08-06)
+
+Real thumbnails landed (`WindowCapture` + `WindowThumbnail`) and exposed a pre-existing bug the flat
+schematic tiles had been hiding: resize a window under tiling and its thumbnail came back
+**squashed**, because the capture reflects reality and the tile it was painted into did not.
+
+**This entry asked which of two causes it was — a stale cache, or a "changed" that never fires. It is
+neither, and both: they have one root, and it is that Hyprland emits NO event for a resize.** Not
+one. The whole `socket2` list (0.56) carries `movewindow` (a *workspace* change), `openwindow`,
+`closewindow`, `changefloatingmode`, `windowtitle`… and nothing geometric. So there was no signal to
+re-sync on, and the cached list held whatever the last unrelated event happened to leave behind.
+Measured, not reasoned: closing a third window on a tiled workspace left Telegram cached at **858 px**
+wide against a real **1722** — `closewindow` is the one window event AstalHyprland handles *without*
+re-reading the rest of the list.
+
+**Fix:** `HyprlandState.readGeometry()` — a coalesced one-shot `hyprctl clients -j` — handed to
+`SchematicHandle.sync(geom)` for that pass only, and awaited *before* the captures are requested (the
+tile size is what a capture is sized to). Deliberately not cached anywhere; the reasoning, including
+why a stored snapshot would eventually be *worse* than the cache it was meant to correct, is in
+`architecture.md` → "Window GEOMETRY is the one piece of window state that no event announces".
+
+Fixed alongside it: the overview's startup layout pass was firing a capture per window for a surface
+nobody was looking at, and every one failed with `buffer_constraints` — the shell was starting, its
+bar and dock were claiming their exclusive zones, and those windows were being resized underneath a
+session that had just advertised the old size. `refresh()` now arms capturing, so nothing captures
+until a surface says it is opening.
+
+⚠️ **Residual, not worth fixing until something asks for it:** a capture taken *while* a window is
+being resized can still fail with `buffer_constraints`, and the shim does not retry. Nothing in
+flight resizes windows any more; a live switcher would.
+
+### 55. ✅ CLOSED — the wallpaper IS the workspace backdrop (2026-08-06)
+
+`WorkspaceSchematic`'s canvas painted a flat `rgba(0,0,0,0.3)`; it now paints the wallpaper actually
+in use, dimmed by `WP_SCRIM` and clipped to a proportional rounded rect. Mechanism and rules in
+`architecture.md` (the schematic's backdrop). Answering the cost question this entry opened with:
+
+- **One decode for the whole shell**, shared by five overview cards and the app grid strip —
+  `WallpaperManager.preview`, bounded to 960px = **2.07 MB measured** (vs ~33 MB for the 4K
+  original), decoded **in a worker thread in 47 ms**. The naive per-tile decode was indeed the wrong
+  version; reusing awww's image was not possible (awww paints in the compositor, it hands nothing
+  back), so a bounded decode of our own is the answer.
+- **One-shot, so the continuous-GPU rule is not engaged**: it is a pixbuf painted by an existing
+  Cairo `draw_func`, not an animation.
+- Because it costs nothing *per surface*, it is deliberately **not opt-in** the way captures are.
+
+### 56. `_workspace.scss` (and 5 other partials) are UNSCOPED — commandment 2 is only two-thirds kept
+
+Found 2026-08-06 while checking whether the overview's layout could read its padding from GTK. The
+compiled `style.css` has `.wo-item`, `.wo-label` etc. as **global** rules. Scoped: `_agent-pointer`,
+`_app-grid`, `_bar`, `_dock`. Not scoped: `_base`, `_components`, `_control-center`, `_prism`,
+`_settings`, `_workspace`.
+
+Not urgent — the class names are distinctive enough that nothing is currently colliding — but it is a
+real violation of commandment 2, and the failure mode it invites is a rule leaking into the greeter
+or lockscreen sheets, which are separate bundles that load their own CSS.
+
+⚠️ **Whoever fixes it should know what it silently changes**: CSS resolves on an unrooted widget
+today *because* these rules are global. Any code that reads a styled value from a widget before it is
+in a tree (`get_style_context().get_padding()` on a probe) starts returning 0 the moment the rule is
+scoped. The overview deliberately does not depend on that read — see `architecture.md` — but a future
+caller might.

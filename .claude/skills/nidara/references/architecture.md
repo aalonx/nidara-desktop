@@ -87,6 +87,143 @@ region, re-read each one asking "can this arrive late?"** — a late input stamp
 late visible stamp is a frame that is never drawn. That question is what found the notification
 banners' deliberately-deferred stamp in `NotificationPopups.tsx` (§46).
 
+### Window capture — real thumbnails, one render pass each
+
+`capture_window()` is consumed through **`core/WindowCapture.ts`** (same lazy-import contract as
+`VisibleRegion.ts`; the kill switch is `NIDARA_WINDOW_CAPTURE=0`). It adds the two things a raw
+async call does not have: **de-duplication** (concurrent asks for one address share a capture) and a
+**concurrency cap of 4**, because each capture is a worker thread with its own Wayland connection and
+past four the compositor schedules them on its frame clock anyway.
+
+The painting side is **`common/WindowThumbnail.ts`** — a `Gtk.Widget` with `vfunc_snapshot` that
+does `append_texture()` inside a `Gsk.RoundedClipNode`. 🔑 **Do not paint captures in a Cairo
+`draw_func`**: `Gtk.DrawingArea` is CPU-side, so it would `download()` the texture out of the GPU on
+every draw — the exact cost the capture design exists to avoid. Rounding is a GSK clip, never a
+post-process, and the radius is passed per-sync because the schematic's is *derived*
+(Hyprland rounding × minimap scale); a fixed CSS radius drifts from the Cairo tile beneath as soon as
+the resolution changes, and the mismatch shows as tile colour at the corners.
+
+**The consumer today is the Workspace Overview**, via `common/WorkspaceSchematic.ts` — which already
+owned the per-window geometry, so thumbnails were an insertion, not a rewrite. Two rules that are
+easy to get wrong there:
+
+- **Capture on OPEN, never on a timer or on `changed`.** `sync()` runs on every HyprlandState
+  "changed" while the surface is open; a capture per event would turn a window drag into a render
+  pass per window per motion event. `SchematicHandle.refresh()` marks stale, the overview calls it on
+  `notify::island-mode`, and `sync()` consumes the flag once. Continuous refresh would also be the
+  continuous GPU draw the animation budget bans (~40 %, see the agent-glow finding).
+  `refresh()` also **arms** capturing: nothing is captured until a surface says it is opening. The
+  overview lays its cards out once at startup (so the first Super+Tab has content to morph into) and
+  that pass used to fire a capture per window for a surface nobody was looking at — all of which
+  failed with `buffer_constraints`, because the shell was starting, its bar and dock were claiming
+  their exclusive zones, and every tiled window was being resized underneath the session that had
+  just advertised the old size.
+- **The app icon is the placeholder AND the identity mark, and the texture lands BEHIND it** (the
+  tile is a `Gtk.Overlay`: thumbnail as child, icon as overlay). So a slow or failed capture leaves
+  the tile exactly as it opened — nothing swaps in, nothing jumps. When a texture does arrive the
+  icon **does not disappear — it shrinks to a badge on the bottom edge** (`applyIconLayout`).
+  Removing it was the first cut and it was wrong: at thumbnail scale the content tells you which
+  DOCUMENT a tile is and only the icon tells you which APP (two Chrome windows are indistinguishable
+  at 150 px). GNOME, macOS Mission Control and KDE all keep it. Do not "clean it up".
+- **Thumbnails are opt-in per surface** (`SchematicOptions.thumbnails`, default OFF). The app grid
+  draws the same schematic for its workspace strip at ~80 px, where a capture is mush and costs a
+  render pass for nothing. Only the overview turns them on.
+
+**The schematic's backdrop is the real wallpaper** (2026-08-06), dimmed by `WP_SCRIM` (0.35) and
+clipped to a proportional rounded rect — same call GNOME, Mission Control and KDE's overview all
+make, and the tiles only read as *foreground* if the background is the desktop they sit on. Note the
+asymmetry with captures: this one is **not** opt-in, because unlike a capture it costs nothing per
+surface. There is exactly ONE decode in the shell, shared by all five overview cards and the app
+grid strip:
+
+- **`WallpaperManager.preview`** is a decoded copy bounded to `PREVIEW_MAX_W` (960 px) — a 4K
+  wallpaper is ~33 MB of pixels to draw something 300 px wide; the bound makes it ~2 MB (measured).
+  `warmPreview()` loads it through `Gio.File.read_async` → `Pixbuf.new_from_stream_at_scale_async`
+  (**decoded in a worker thread**: the synchronous loader is a ~50–100 ms main-loop stall, i.e. a
+  visible hitch in whatever animation is running when a surface opens), then emits **`"preview"`** —
+  a separate signal from `"changed"` precisely because the decode lands long after the wallpaper did.
+- `warmPreview()` **re-resolves the path from disk** (`resolveWallpaper("shell")`) on every call and
+  no-ops when path and cache agree, so it is safe to call anywhere. It has to work that way: the
+  wallpaper also changes behind this manager's back — gaming hero-art swaps it through
+  `hyprland.lua`, and `_current` is only a hint (awww owns the live one). Called at schematic build
+  time, from `SchematicHandle.refresh()` (surface opening), and by `WallpaperManager` itself after it
+  emits `"changed"`.
+- Cover-fit scaling goes through **`makeCoverFit()` in `common/DrawingUtils.ts`** — a closure holding
+  ONE painter's cached scaled copy. `scale_simple` allocates a new pixbuf, so scaling straight from a
+  `draw_func` re-allocates the image every frame; every consumer needs that guard, which is why it is
+  a shared primitive rather than a helper (`squircleThumb` uses the same one).
+- ⚠️ Painting a *pixbuf* in a Cairo `draw_func` is fine and does not contradict the rule above about
+  captures: the ban is on downloading a GPU **texture** back to the CPU per draw. A pixbuf is already
+  CPU-side, and the schematic's backdrop shares the canvas that paints the tiles.
+
+🔴 **The overview's card size is solved from the MONITOR, never hardcoded (2026-08-06).** It used to
+be a flat 300px preview — which made the panel a flat 1798px: only 70 % of a 2560 screen, and *wider
+than a 1600px laptop*, where it would simply have overflowed. `previewWidthFor(gdkmonitor)` in
+`WorkspaceOverview.tsx` solves `2·margin + 2·pad + (n−1)·gap + n·(preview + chrome) = monitorWidth`
+so the panel lands `WO_EDGE_MARGIN` (8px) from each edge. It stays a floating glass panel — this is
+deliberately *not* a full-bleed Mission Control mode (user, 2026-08-04).
+
+- The monitor comes down the constructor chain — `Bar(gdkmonitor)` → `ActivityIsland(gdkmonitor)` →
+  `WorkspaceOverview(gdkmonitor)` — because the bar and its island are already built **once per
+  monitor** (`createUI` in `app.ts`). Use `Gdk.Monitor.get_geometry()`: logical px, the same space
+  the panel is laid out in.
+- 🔑 **The spacing it solves with is NOT declared in CSS — that is the point, do not "restore" it.**
+  `.workspace-overview` and `.wo-item` carry no padding; `WO_PANEL_PAD` / `WO_CARD_PAD` are applied
+  as GTK margins from `WorkspaceOverview.tsx`, which is also the file doing the arithmetic. A margin
+  inside a styled parent *is* a padding, so nothing moved (re-measured: 1348 / 1903 / 2543 / 3823,
+  identical to the CSS-padding version). **The general shape**: when a layout has to *solve* for a
+  spacing value, that value cannot live in the stylesheet — CSS keeps what it is uniquely good at
+  (fill, border, radius, states) and TS owns the number outright. Only `.wo-item`'s `border: 1px`
+  is still read from CSS, as `WO_CARD_BORDER`: a border is not a spacing token and does not move.
+- ⚠️ **The obvious alternative is a trap, and it was measured before being rejected.**
+  `get_style_context().get_padding()` resolves correctly *even on an unrooted, unrealized widget*
+  (verified 2026-08-06: returns 16/1 for `.wo-item` with no window at all), so "just ask GTK" looks
+  like the clean answer. It only works because `_workspace.scss` is currently **unscoped**. Scope it
+  under `window#…` — which commandment 2 says it should be — and a not-yet-rooted probe stops
+  matching, the read returns **0**, and the layout silently falls back to a stale constant. Giving
+  the probe the real ancestry only trades a mirror of numbers for a mirror of structure. Prefer
+  owning the number to querying for it whenever the query depends on selectors matching.
+- ⚠️ **The win is not uniform, so do not sell it as a scale factor**: 2560 → preview 449 (panel 2543),
+  but 1920 → 321, barely above the old 300. Wide screens are where it pays; on a 1080p laptop the
+  point is that it now *fits*. Verified against the real widget tree with an offscreen GTK probe
+  (Broadway backend, real `style.css`) at 1366/1920/2560/3840 — all land at 8.5px per side.
+
+🔴 **Window GEOMETRY is the one piece of window state that no event announces — ask for it, do not
+listen for it (2026-08-06).** Hyprland's IPC has **no resize event, and none for a move inside a
+workspace either**: the whole `socket2` event list (0.56) carries `openwindow`, `closewindow`,
+`movewindow` (a *workspace* change, not a geometric one), `changefloatingmode`, `fullscreen`,
+`windowtitle`… and nothing for x/y/width/height. AstalHyprland therefore re-reads the client list on
+the events it *does* get, and `hs.clients` carries whatever geometry that last read happened to see.
+Two ways it goes wrong, and both were measured, not reasoned:
+
+- **Resize a window** and nothing at all fires — the cache keeps the old size until some unrelated
+  event (a title change is the usual one) re-syncs it by accident. That is why the symptom is
+  intermittent: with a spinner in a terminal the cache self-heals every second, without one it never
+  does.
+- **Close a window in a tiled workspace** and AstalHyprland removes that one client *without*
+  re-reading the rest (`hyprland.vala`, `case "closewindow"`), so every survivor keeps the size it
+  had while the closed window was still taking up room. Measured 2026-08-06: closing a third window
+  left Telegram cached at **858 px** wide when it was really **1722** — a thumbnail squashed into
+  half its width.
+
+**`HyprlandState.readGeometry()`** is the answer: one coalesced `hyprctl clients -j` returning
+`Map<bareAddress, {x,y,width,height}>`, passed into `SchematicHandle.sync(geom)` for that pass only.
+It is deliberately **not** cached state — a snapshot held anywhere would eventually be *older* than
+the cached objects it was meant to correct. `hs.clients` stays the right source for identity (class,
+`initialTitle`) and workspace, which do arrive by event. The overview re-asks on every pass it makes
+while open, and the read has to **land before the captures are requested**: the tile size is what the
+capture is sized to, and a capture is taken once per open.
+
+🔴 **Window addresses do not have one format.** `hyprctl clients` and `ags request listWindows`
+report `"0x555b0a0cad80"`; the AstalHyprland client objects behind `hs.clients` report the same
+address as bare `"555b0a0cad80"`. `BigInt()` accepts the first and throws on the second, so feeding
+the shim from the wrong source captures **nothing, silently**. `WindowCapture.parseAddress()`
+normalises, and `HyprlandState.ts` has `bareAddr()` for the comparison direction — use them rather
+than parsing an address by hand.
+
+⚠️ **Never send a diagnosable failure to `console.debug` in GJS** — it is suppressed unless
+`G_MESSAGES_DEBUG` is set, which turns a broken feature into a silent one. `console.warn`.
+
 ### Focus grab — modality that the compositor enforces
 
 `focus_grab_*()` speaks `hyprland-focus-grab-v1`. From the shell go through
