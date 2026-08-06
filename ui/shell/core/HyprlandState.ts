@@ -474,39 +474,76 @@ class HyprlandStateClass extends GObject.Object {
         return this._dispatch(`hl.dsp.focus({ workspace = ${id} })`)
     }
 
-    /** Switch workspace from a surface that is CLOSING — i.e. one that is giving up
-     *  an EXCLUSIVE keyboard grab in the same gesture (the island's overview, and
-     *  anything that copies it). Plain `focusWorkspace` silently loses that race.
+    /**
+     * Switch workspace from one of OUR surfaces. The single entry point for it, so
+     * the app grid and the island's workspace overview cannot drift apart — and the
+     * reason it still exists even though it now just forwards.
      *
-     *  Releasing a grab makes Hyprland refocus the last window, and focusing a window
-     *  that lives on another workspace DRAGS THE WORKSPACE BACK — so the user clicks
-     *  an empty workspace, lands on it, and is yanked to where they came from. It only
-     *  bites empty targets: with a window of its own on the target, the refocus lands
-     *  there and nothing moves.
+     * It used to have to lend the caller's keyboard grab away first, because Hyprland
+     * REFUSES to move window focus while a layer surface holds EXCLUSIVE
+     * (`m_exclusiveLSes`, the rule `core/InputYield` exists for): switching first
+     * landed you on a workspace with NOTHING focused, and when the surface later
+     * dropped the grab, `refocusLastWindow` answered with the window you came from
+     * and dragged that workspace back over you. Measured 2026-08-05 closing the app
+     * grid from the dock button: `5 → 1 @425ms → 5 @454ms` — a 29 ms round trip that
+     * read as the workspace animation setting off and changing its mind.
      *
-     *  Asking for the release is not performing it. Layer-shell keyboard interactivity
-     *  is DOUBLE-BUFFERED: the compositor applies it on the surface's next commit.
-     *  Measured on the event socket against the shell's own log (2026-07-26):
-     *
-     *      t+0 ms   set_keyboard_mode(NONE) requested, dispatch spawned
-     *      t+8 ms   workspace>>5      the hyprctl subprocess already landed
-     *      t+12 ms  activewindow>>,   the release only NOW reaches the compositor
-     *      t+12 ms  workspace>>1      …and takes the workspace with it
-     *
-     *  So a subprocess spawn beats our own Wayland state by ~4 ms and reordering the
-     *  two calls cannot help (tried, measured, still 12/21 failures). Wait for the
-     *  compositor to ANNOUNCE the release instead — that announcement is the
-     *  `activewindow` null this class already reconciles (see `focusedClient`). */
-    focusWorkspaceOnGrabRelease(id: number) {
-        this.afterGrabRelease(() => this.focusWorkspace(id))
+     * 🔑 A compositor focus grab does not refuse focus moves, which is the whole
+     * reason `common/FocusGrab.ts` replaced EXCLUSIVE, so there is nothing left to
+     * hand over: the switch focuses the target's own window and the later release has
+     * nothing to drag. Keep going through here anyway — if a shell surface ever needs
+     * to do something before a switch again, this is where it belongs.
+     */
+    focusWorkspaceFromShell(id: number) {
+        return this.focusWorkspace(id)
     }
 
-    /** Run `cb` once the compositor has ANNOUNCED that a shell surface gave up its
-     *  EXCLUSIVE keyboard grab — the generic half of `focusWorkspaceOnGrabRelease`
-     *  (read its comment for the measurement this encodes). Any caller that has just
-     *  asked a surface to drop the grab and must not act until the compositor has
-     *  actually applied it goes through here: the workspace switch above, and the
-     *  input yield that lets computer-use reach a real window (`core/InputYield`).
+    /** Hand the keyboard back to the window the user was working in, after one of our
+     *  surfaces let go of a compositor focus grab.
+     *
+     *  WHY IT IS NEEDED. Dropping the grab makes Hyprland refocus by POINTER
+     *  (`CSeatManager::setGrab(nullptr)` → `input:follow_mouse` = 1 → `refocus()`), so
+     *  where the mouse happens to rest decides who gets the keyboard. Measured
+     *  2026-08-05: dismiss a panel onto a window and that window is focused; dismiss it
+     *  with the pointer over the wallpaper — by clicking there OR by pressing Esc while
+     *  the pointer merely sits there — and the session is left with NO active window at
+     *  all. A plain desktop click with nothing open does not do that, so it is specific
+     *  to dropping a grab. Working from the keyboard, that means every dismissal
+     *  silently costs you the window you were typing in.
+     *
+     *  ⚠️ ONLY when the compositor was left with nothing focused. Refocusing over the
+     *  top of a window the user just clicked would be worse than the bug.
+     *
+     *  ⚠️ ONLY on the workspace the user is looking at — `focusedClient` guarantees
+     *  this (see it: it never answers with a window from the workspace you just left).
+     *  Focusing a window that lives elsewhere DRAGS THE WORKSPACE ALONG, so dismissing
+     *  a panel on an empty workspace would teleport the user off it. Nothing to focus
+     *  here means we leave it alone — an empty workspace is allowed to be empty.
+     *
+     *  Timed off the compositor's own announcement rather than a delay, because asking
+     *  for the release is not performing it — see `afterGrabRelease`. */
+    restoreFocusAfterGrab() {
+        this.afterGrabRelease(() => {
+            if (this.hl.focused_client) return   // the compositor found someone: leave it
+            const addr = (this.focusedClient as any)?.address
+            if (addr) this.focusWindow(addr)
+        })
+    }
+
+    /** Run `cb` once the compositor has ANNOUNCED that a shell surface gave up the
+     *  input it was holding. Any caller that has just asked a surface to let go and
+     *  must not act until the compositor has actually applied it goes through here:
+     *  `restoreFocusAfterGrab` above, and the input yield that lets computer-use
+     *  reach a real window (`core/InputYield`).
+     *
+     *  Asking for a release is not performing it. This was measured on the
+     *  double-buffered layer-shell path, where the compositor only applies the change
+     *  on the surface's next commit — on the event socket against the shell's log
+     *  (2026-07-26), a spawned `hyprctl` beat our own Wayland state by ~4 ms and
+     *  reordering the two calls could not help (tried, measured, 12/21 still failed).
+     *  A focus-grab release is NOT double-buffered, so that particular race is gone;
+     *  what remains is that `refocus()` still happens on the compositor's clock, not
+     *  ours, which is what the callers above are waiting for.
      *
      *  The 80 ms fallback covers "no announcement is coming" — with nothing focused
      *  to lose, the release passes in silence. Not a tuning knob: the measured window

@@ -26,14 +26,15 @@ Read this when adding/editing widgets, changing how overlays attach, modifying a
 ## `lib/nidara-wl/` — the Wayland shim (the project's only native library)
 
 **Why it exists:** GJS cannot speak raw Wayland. `libwayland-client` has no introspection, and
-`gdk_wayland_surface_get_wl_surface` is `introspectable="0"` in `GdkWayland-4.0.gir`. Two things the
-shell needs are unreachable from TypeScript without a C shim, and they are the *same* shim, which is
-why one library carries both:
+`gdk_wayland_surface_get_wl_surface` is `introspectable="0"` in `GdkWayland-4.0.gir`. Several things
+the shell needs are unreachable from TypeScript without a C shim, and they are the *same* shim, which
+is why one library carries all of them — the packaging cost is paid once:
 
 | Capability | Protocol | What it unlocks |
 |---|---|---|
 | `capture_window()` → `GdkTexture` | `ext-image-copy-capture` + `ext-foreign-toplevel-image-capture-source` + `hyprland-toplevel-mapping` | Real window thumbnails (Overview, window switcher) |
 | `visible_region_*()` | `hyprland-surface-v1` **v2** | The layer-blur cost in `tech-debt.md` §46 |
+| `focus_grab_*()` | `hyprland-focus-grab-v1` | Keyboard without layer-shell EXCLUSIVE + compositor-side outside-click dismissal |
 
 Built by `lib/nidara-wl/build.sh` — plain `cc` + `wayland-scanner` + `g-ir-scanner`, deliberately no
 build system, same reasoning as `bin/nidara-input.c`. Installed to `/usr/lib/libnidara-wl.so*` with
@@ -85,6 +86,154 @@ what says "still moving"). 🔑 **Before wiring a region to the same call sites 
 region, re-read each one asking "can this arrive late?"** — a late input stamp costs a late click, a
 late visible stamp is a frame that is never drawn. That question is what found the notification
 banners' deliberately-deferred stamp in `NotificationPopups.tsx` (§46).
+
+### Focus grab — modality that the compositor enforces
+
+`focus_grab_*()` speaks `hyprland-focus-grab-v1`. From the shell go through
+**`common/FocusGrab.ts`** (same lazy-import contract as `VisibleRegion.ts`; the kill switch is
+`NIDARA_FOCUS_GRAB=0`). **Every modal surface is on it: the bar's overlays, the island, and the app
+grid.**
+
+🔴 **It is a HARD REQUIREMENT, not an enhancement (2026-08-05).** The full-screen `overlay-catcher`
+buttons that used to fake "click outside closes" are deleted, and so is the layer-shell
+`EXCLUSIVE`/`ON_DEMAND` path that used to carry the keyboard. There is nothing to degrade to: no
+grab means no dismissal and nothing typable, and each surface says so on stderr rather than
+half-working. `install.sh` fails the install if libnidara-wl builds without `focus_grab_*`, and
+`NIDARA_FOCUS_GRAB=0` is a debugging escape hatch for a STUCK grab, not a supported mode. When
+adding a modal surface: acquire, and treat a 0 as broken — do not invent a fallback.
+
+🔑 **A grab whitelists a SET of surfaces, and you must pass every surface of yours that has to stay
+clickable — not just the modal one.** On an outside press the compositor delivers the button to
+whatever holds pointer focus, the grab CLAMPS pointer focus to itself, and only then clears. So a
+press outside the set dismisses and *does nothing else* — it never reaches what you clicked. **The
+bar and the island each whitelist the other**, symmetrically: the island's capsule lives on the
+island's surface (commandment #5's exception), so a bar panel grabbing only itself makes the whole
+island unclickable, and vice versa. Capsule-to-capsule switching has to stay one click, and nothing
+else is arranging it.
+
+🔑 **One grab, two owners → `acquireFocusGrab` returns an ownership TOKEN and `releaseFocusGrab(token)`
+no-ops for anyone else.** The shim holds a single grab (the compositor has a single slot) but the bar
+and the island ask for it independently, so a bare `release()` destroys *whatever grab exists*: island
+mode open → bar panel opens and legitimately evicts it → the island's own close handler then runs and
+takes down the BAR's fresh grab, leaving the bar convinced it is modal while holding nothing.
+Acquiring while someone holds also **invokes the previous owner's `cleared`** — an eviction is
+indistinguishable from a popup stealing the slot, and an owner left believing it is still modal never
+re-acquires.
+
+🔑 **The bar strip is INSIDE the grab, so dismissing there is GTK's job.** The whole point of
+whitelisting the bar is that a press on it is accepted — which also means the compositor will never
+dismiss for a press on the empty space between capsules. (The catchers could not cover that space
+either: one full-window button covering the strip would have swallowed the capsule presses that make
+switching one click. Same dead zone, unreachable by both mechanisms.) Only GTK can tell a capsule
+from the bar around it, via a **bubble-phase `GestureClick` on `masterOverlay`** that calls
+`dismissOverlays()`. Keep both dismissal paths (`cleared`, strip gesture) sharing that one body so
+they cannot drift. Two traps in it:
+
+- ⚠️ **It cannot assume the control "claimed" the press.** `SquircleContainer`'s click gesture fires
+  on `pressed` and deliberately does NOT claim the sequence (a competing `GestureDrag` must be able
+  to cancel it — that is how banners swipe). So a bubble gesture runs **in addition to** the
+  capsule's, and dismissing unconditionally closes the panel the capsule opened one event earlier.
+  It has to ask what it hit: `pick()` the point and walk up to the overlay, skipping if anything on
+  the way carries a `Gtk.Gesture`. Asking the widget beats an allowlist of "the bar's background",
+  which rots silently every time the bar grows a widget.
+- ⚠️ **`masterOverlay`, not `barBox`.** `.bar-centerbox` carries `margin-top: 8px`, and a CSS margin
+  lies OUTSIDE the allocation: the bar window is 40px tall and `barBox` measures **y=8, h=32, x=8**
+  (`query_ui`), so the 8px bands above it and at both ends belong to the overlay behind it. They are
+  inside the input region and read as bar to the user.
+- 🔑 **It asks nothing about coordinates.** A `y < BAR_H` test works — GTK and layer-shell both speak
+  logical pixels, so display scaling does not move it — but it states the bar's height in the one
+  place with no business knowing it. The overlay structure already says what we mean: masterOverlay's
+  **child** is the bar, its **overlays** are the panels. So the walk records the last widget before
+  masterOverlay and dismisses when that is `barBox` or nothing at all. Geometry-free, and correct
+  wherever the bar sits or however tall it grows.
+
+⚠️ **Anything of ours covering the desktop defeats the grab, including the OTHER surface's.** A
+whitelisted surface that accepts a press the compositor needed to see OUTSIDE the grab silently
+becomes the dismissal mechanism, and a broken one. This bit as a catcher first: the bar's was keyed
+off the bar's own grab, but `isAnyOverlayOpen` includes `island_mode`, so while an island mode was
+open the bar still covered the desktop — and since the island whitelists the bar, every "outside"
+press landed on a whitelisted surface. The compositor never dismissed and never ran its refocus, and
+it read as "the island restores focus and bar panels do not" (measured 2026-08-05). The catchers are
+gone, but **the input region is the same hazard**: stamp only what you PAINT, never a screen-sized
+rect, and never leave a panel's inflated invisible bounds in it (see §46 and the NC's
+`propagate_natural_height`).
+
+🔑 **A press outside the grab is delivered to the GRABBED SURFACE first.** Under a grab the compositor
+clamps pointer focus, so our window receives button presses at coordinates far outside anything we
+own — before the grab is cleared. Any "did the user press our chrome?" test must therefore be bounded
+by GEOMETRY as well as by widget identity: "the press hit no control of ours" is true of every
+outside click. Getting this wrong makes us dismiss the panel ourselves, which looks correct and is
+not: it takes the dismissal away from the compositor, and with it the refocus.
+
+🔑 **Dropping a grab refocuses by POINTER, so give the keyboard back explicitly.**
+`CSeatManager::setGrab(nullptr)` honours `input:follow_mouse` (1 → `refocus()`), which means the
+window that gets the keyboard is whatever the mouse rests on. Measured 2026-08-05: dismiss onto a
+window and that window is focused; dismiss with the pointer over the wallpaper — by clicking there OR
+by pressing Esc while it merely sits there — and the session is left with NO active window. A plain
+desktop click with nothing open does not do that, so it is specific to dropping a grab, and working
+from the keyboard it costs you the window you were typing in on every dismissal. `FocusGrab.ts` calls
+`HyprlandState.restoreFocusAfterGrab()` whenever our machinery ends up holding nothing, with two
+guards that are the whole design: only when the compositor was left with **nothing** focused (never
+over the top of a window the user just clicked), and only on the workspace the user is **looking at**
+(focusing elsewhere drags the workspace along, so an empty workspace is allowed to stay empty). Timed
+off the compositor's own announcement via `afterGrabRelease`, not a delay.
+
+⚠️ **Scope each `cleared` handler to what its own surface owns.** The bar closes only its overlays,
+the island only `island_mode`; a handler reaching further would shut whatever the other surface just
+opened. The wider "close everything" belongs to `dismissOverlays()`, which runs off a REAL click on
+the bar strip rather than off an eviction.
+
+⚠️ **An input region stamped in the same turn as `reveal(true)` describes the panel as ABSENT** — a
+widget just made visible has no allocation until the next layout pass. This is invisible without a
+grab (the catcher's hand-written full-screen rect covered it by accident) and fatal with one: the
+press misses our surface, the compositor sees a surface outside the whitelist, and the panel dismisses
+as you click into it. Both revealers therefore expose **`onAllocated`**, fired from
+`vfunc_size_allocate`, and the bar's panels + the island's modes re-stamp from it. Mechanical, not a
+deferred timeout hoping layout happened.
+
+What a grab replaces, all three verified in Hyprland 0.56's source:
+
+- **Keyboard without `EXCLUSIVE`.** `CFocusGrab` drives `CFocusState::rawSurfaceFocus` directly and
+  `setKeyboardFocus` never looks at layer interactivity, so a surface at `NONE` gets the keyboard.
+  🔑 That matters far beyond convenience: `EXCLUSIVE` is what puts a surface in
+  `m_exclusiveLSes`, and **that list makes Hyprland refuse to move window focus at all** — the sole
+  reason `core/InputYield` exists.
+- **Outside-click dismissal.** A press outside sets `m_hardInput` and re-runs the hit test
+  (`InputManager.cpp`); a surface the grab does not accept clears it. That was the whole job of the
+  invisible full-screen `overlay-catcher` buttons, now deleted — so a grabbing surface must **stop
+  covering the desktop with its input region**, or the press lands on us, the grab accepts it, and
+  nothing dismisses.
+- **Release is not double-buffered.** Layer-shell interactivity applies on the surface's next commit
+  (the ~12 ms race `HyprlandState.afterGrabRelease` exists for). Destroying a grab takes effect when
+  the compositor reads the request. On release the compositor also refocuses the window the user came
+  from, honouring `input:follow_mouse` — we no longer do that by hand.
+
+⚠️ **There is exactly ONE grab slot compositor-wide** (`CSeatManager::m_seatGrab`) **and xdg-shell
+popups use the same one.** A `Gtk.Popover` with `autohide` opening anywhere evicts the grab. So
+`cleared` has three indistinguishable causes — outside press, popup grab, or a layer surface mapping
+with interactivity ≠ NONE (`LayerSurface.cpp`, which still carries upstream's `TODO: use the new
+superb really very cool grab`). **Treat `cleared` as "I no longer hold input", never as "the user
+dismissed me".**
+
+🔑 **`FocusGrab.ts` separates the popup cause itself, and callers never see it.** The protocol says
+nothing about why, but our own widget tree does: a `Gtk.Popover` is a CHILD of the widget it is
+parented to, so on `cleared` it walks the lease's windows for a mapped popover. If it finds one the
+lease is **suspended** — not closed — and retaken on the popover's `closed`. Without that, opening a
+menu inside a surface dismisses the surface the menu belongs to: the island's media source selector
+(`widgets/media.ts`, `autohide: true`) and GTK's own right-click menu on the assistant's `Gtk.Text`
+both did exactly that. It also means `acquireFocusGrab` takes **`Gtk.Window`s, not `Gdk.Surface`s** —
+it needs the widget tree, and `get_native()?.get_surface()` is untyped from the GIR anyway (passing a
+bare surface where the set was expected once type-checked cleanly and threw at runtime).
+
+⚠️ **The grab takes the pointer too** (`m_keyboard` *and* `m_pointer` are hardcoded true) — there is
+no pointer-only mode. Any surface that adopts it starts taking keyboard focus from the user's window,
+which is fine for Prism and a real behaviour change for a panel like the CC. It is also **not
+enforced during DnD** (`!dndActive()`), which matters for the dock's drag.
+
+⚠️ **Our objects live on a private `wl_event_queue`, so nothing dispatches `cleared` for us.** The
+shim pumps `wl_display_dispatch_queue_pending` on a 50 ms timer **while a grab is held** — it never
+reads the fd (GDK owns it, and `wl_display_read_events` already distributes to every queue). The
+interval is how long a dismissal can lag; it is not a polling loop for state.
 
 ## Boot sequence
 
@@ -438,14 +587,14 @@ These are GObject singletons. Widgets subscribe to them via `notify::prop`. **No
 | File | LOC | Role |
 |---|---|---|
 | `Status.ts` | 202 | Central GObject state machine for overlays. Mutually-exclusive setters (opening one closes the others). Props: `cc/nc/prism/system-menu/about/settings-open`, `island-mode` (Activity Island mode string, "" = collapsed; replaced `overview-open`), `recording`, `cc-edit-mode`, `bar-expanded-id`, `cc-detail-id`. Exports island mode ids (`ISLAND_OVERVIEW`, `ISLAND_PLAYER`, `ISLAND_BATTERY`). **See `state-and-ipc.md`.** |
-| `InputYield.ts` | ~125 | The shell **stepping out of the way** so computer-use can reach a real window. Hyprland's `rawWindowFocus` refuses to move window focus at all while any layer surface holds an EXCLUSIVE keyboard grab, and routes the pointer to that surface regardless of its input region — so from inside the Assistant island (always grabbing) `focus_window` was a no-op and clicks were swallowed. `begin()` makes every grabbing surface drop to `NONE` **and** stamp an empty input region, resolves only once the compositor has ANNOUNCED the release (`HyprlandState.afterGrabRelease`), `end()` restores. Driven by the HELPERS via the `yieldInput` IPC (so external MCP clients are covered too), re-entrant, with a 15 s watchdog so a helper that dies mid-action cannot leave the shell keyboard-less. Surfaces opt in with `registerHolder()` + a `notify::active` handler: Bar (Prism), IslandWindow, DockCore (app grid). **See `state-and-ipc.md`.** |
+| `InputYield.ts` | ~125 | The shell **stepping out of the way** so computer-use can reach a real window. A grabbing surface CLAMPS pointer focus to itself, so from inside the Assistant island (always grabbing) clicks were swallowed and `focus_window` was a no-op. (Under the old layer-shell path the reason was different and stronger — `rawWindowFocus` refuses to move window focus at all while a surface is in `m_exclusiveLSes` — which is why this module survived the focus-grab migration rather than dying with it.) `begin()` makes every grabbing surface RELEASE its focus grab **and** stamp an empty input region, resolves only once the compositor has ANNOUNCED the release (`HyprlandState.afterGrabRelease`), `end()` restores. Driven by the HELPERS via the `yieldInput` IPC (so external MCP clients are covered too), re-entrant, with a 15 s watchdog so a helper that dies mid-action cannot leave the shell keyboard-less. Surfaces opt in with `registerHolder()` + a `notify::active` handler: Bar (Prism), IslandWindow, DockCore (app grid). **See `state-and-ipc.md`.** |
 | `AppService.ts` | 685 | `.desktop` discovery, icon resolution + fallbacks, WM-class → Desktop-ID mapping. Backs Dock + AppGrid. **Launching: ALWAYS go through `getLaunchCommand(id)`** (wrapped in `uwsm app -- sh -c 'cd "$HOME" && exec <cmd>'`): it picks `flatpak run` for flatpak entries (gtk-launch's D-Bus activation dies silently for them when the session bus indexed its service dirs without the flatpak exports) and `gtk-launch` for everything else. Never parse `Exec=` by hand. Flatpak/Snap *discovery* requires `XDG_DATA_DIRS` set **before gjs starts** — done in `bin/nidara-ui`; GLib caches data dirs at first use, so patching the env in-process cannot fix it (verified 2026-06-12). **Icon LOOKUP is centralized here; app IDENTITY is the step surfaces keep skipping** (both bugs below found 2026-08-02, from one user report). `getIconName` answers "what art is this icon name", never "which app is this thing" — so a surface holding a foreign identity string must normalize it FIRST, and there are three entry points depending on what you hold: **`resolveWindowApp(class)`** for a Hyprland window, **`iconForAppName(name)`** for a human display name, **`isGenericIconName(n)`** to test whether a name you were handed is a placeholder rather than an answer. Skipping the step doesn't error — it renders the generic glyph, so the only symptom is two surfaces drawing the same thing differently. Concretely: the workspace overview fed `c.class` straight in, and since no theme has an icon called `io.Astal.ags`, **Settings drew the generic glyph in the overview and its registry icon in the dock** (the dock normalizes; the overview didn't). And the CC/Settings audio rows took AstalWp's `stream.icon` at face value — but that property is NEVER empty: a client declaring no `application.icon-name` gets `application-x-executable-symbolic`, a perfectly resolvable name for the generic glyph, so **GNOME Clocks played audio under a gear**. Same rows also had the app name wrong: on an AstalWp stream `name` is the STREAM ("Playback Stream") and `description` is the client ("Clocks"). The notification centre survives both only because it asks the registry FIRST (`getResolvedApp(desktop_entry || app_name)`) — its no-match fallback was hardened the same day. **The audit behind those fixes is done: every icon call site in the shell is listed by `grep -rn "getIconName(\|iconForAppName(\|resolveIconChain(\|resolveWindowApp("`, and all of them now normalize. `surfaces/bar/Schematic.tsx` was deleted in the same pass** — 195 dead lines nothing imported, superseded by `common/WorkspaceSchematic.ts`, still carrying both bugs plus `nd-icon` on app icons. Dead code that models the wrong pattern is worse than none; it is what a grep finds first. For ordered icon-name fallback chains use `resolveIconChain(names)` (theme-first: any name in the ACTIVE theme beats earlier names that only exist in deep fallbacks or shipped assets; absolute-path entries = final custom fallback) — plain `getIconName(array)` exhausts deep fallbacks per name. Icon resolution NEVER mixes themes: per-app override (`~/.local/share/icons/nidara/`) → active theme (+ its `Inherits`) → hicolor (the app's own installed icon) → pixmaps. An icon the active theme lacks is fixed via the Settings → Apps per-app override, never by borrowing from another installed theme. When nothing resolves, app surfaces (dock, app grid, Prism, overview) fall back to `application-x-executable` (the active theme's generic app icon) — never GTK's broken-image `image-missing`. **Per-app override GOTCHA:** overrides are stored under the basename key (`iconOverlayKey`, e.g. `/opt/foo/bar.png` → `bar`), and `AppData.icon` is **canonicalized to the resolved override PATH** once one exists — so callers usually hold a *path*, not a name. Any override lookup (`getIconOverridePath`/`removeIconOverride`) must normalize through `iconOverlayKey` (idempotent on keys), or Restore/badge/delete silently no-op on path-valued icons (bit App Icons for Antigravity, fixed 2026-07-04). After `set/removeIconOverride` (which call `reload()` **synchronously**) re-read fresh state via `getAppData(id)` — the caller's own `AppData` is a stale snapshot whose `.icon` may point at a just-deleted overlay file. |
 | `TrashService.ts` | ~125 | Watches the trash (gvfs `trash:///` + `trash::item-count`, aggregates all volumes; falls back to a FileMonitor on `~/.local/share/Trash/files`). Exposes `isEmpty`/`itemCount` + `subscribe`. Drives the dock trash icon (full ↔ empty, swapped in place by DockItem). |
 | `ThemeManager.ts` | 534 | GTK/icon/cursor theme, dark mode, CSS providers (main/font/tokens/tint), hot-reload of `style.css` in dev. Also pushes the accent into Hyprland's **groupbar** active-tab color (`syncHyprlandGroupAccent`, at boot + on accent change, via `hs.evalLua`) — the one place accent enters compositor chrome; the rest of the group styling is static in `hyprland.lua`'s `group` block (glass borders like windows). Gotcha: a groupbar **bakes its colors at group creation** — config changes only affect groups made afterwards. **Font gotcha:** the interface font is the one appearance prop NOT in `appearance.json` — it's delegated to the GNOME `font-name` gsetting (`syncFont`/`setFont`/`settings.ini` all read it). `applyAll` **seeds it to `Inter 11` on first boot**, but only when `get_user_value("font-name") === null` (factory default, not an explicit pick) — otherwise a fresh Arch + GTK ≥4.22 leaves it at `Adwaita Sans 11`. `monospace-font-name` is seeded the same way to `JetBrainsMono Nerd Font 11` (the schema default names Adwaita Mono, a font Nidara doesn't install; the JetBrains nerd font ships with every install). |
 | `NidaraTheme.ts` | 436 | Token engine: `generateTokensCss()` emits `@define-color` + `--nidara-*` for accent, transparency, materials, shadows, tint. Holds the canonical `ACCENT_PALETTE`. Syncs Kvantum/qt. |
 | `RegionConfig.ts` | 218 | Time/date format, timezone (`region.json`). |
 | `InputConfig.ts` | 194 | Keyboard/mouse/touchpad → writes `nidara-settings.lua`. |
-| `HyprlandState.ts` | ~290 | Reactive wrapper over AstalHyprland (clients/workspaces/monitors + dispatch helpers) **and the ONLY door to hyprctl**. `focusedClient` is a **reconciled** accessor, not a proxy — it enforces one invariant, *the focused window is always on the focused workspace*, against two opposite compositor lies: the null Hyprland announces when one of our layer surfaces releases an EXCLUSIVE grab, and the stale non-null it keeps returning while a grab is HELD (it refuses to move window focus at all then, so the app grid's workspace strip left the title naming the workspace you left). Fallback chain and the scratchpad exception in `state-and-ipc.md`; read it, never `hl.focused_client` — services/widgets never shell out to hyprctl directly; they call (or add) a method here. Vocabulary: dispatch helpers (`focusWindow`/`closeWindow`/`floatWindow`/`togglePseudo`/`togglePin`/`toggleFullscreen`/`centerWindow`/`sendToWorkspace`/`toggleGroup`/…, all `hl.dsp.*` Lua via a private `_dispatch` that logs the offending call), `getClientJson(addr)` (one-shot raw `clients -j` read for fields AstalHyprland.Client lacks: `pinned`, `grouped` — on demand only, never in `_refresh`), `evalLua(call)` (live config changes — the Lua parser rejects `keyword`), `getOptionInt(name)` (sync) / `getOptionJson(name)` (async batch re-syncs), `setCursor(theme, size)`, `setRealCursorVisible(visible)` (`cursor:invisible`; rendering only, input unaffected — sole caller is the agent-pointer overlay, which hides the real pointer for the length of an AI action because the hardware cursor plane paints above every layer surface; **whoever hides it owns restoring it on every exit path**), `setGlow(enabled)` + `supportsGlow()` (`decoration:glow`, driven only by `AgentGlow.ts`), `version()`. **`focusWorkspaceOnGrabRelease(id)` is not a variant of `focusWorkspace` you may skip**: a surface that switches workspace *while closing* must use it, or the grab release it just triggered refocuses the last window and drags the workspace back (`state-and-ipc.md` — measured; ordering the calls differently does NOT fix it). Caches **effective** config AstalHyprland doesn't expose (`availableModesByName` — `Monitor.available_modes` is always null) and emits `config-reloaded` on Hyprland's `configreloaded` IPC event (effective-config consumers re-sync on it). Exempt from the single-door rule: config text *written for other daemons* (the hypridle config generated by Power.tsx — those lines execute outside the shell; the before/after-sleep hooks themselves are static scripts in `bin/`). |
+| `HyprlandState.ts` | ~290 | Reactive wrapper over AstalHyprland (clients/workspaces/monitors + dispatch helpers) **and the ONLY door to hyprctl**. `focusedClient` is a **reconciled** accessor, not a proxy — it enforces one invariant, *the focused window is always on the focused workspace*, against two opposite compositor lies: the null Hyprland announces when one of our layer surfaces releases an EXCLUSIVE grab, and the stale non-null it keeps returning while a grab is HELD (it refuses to move window focus at all then, so the app grid's workspace strip left the title naming the workspace you left). Fallback chain and the scratchpad exception in `state-and-ipc.md`; read it, never `hl.focused_client` — services/widgets never shell out to hyprctl directly; they call (or add) a method here. Vocabulary: dispatch helpers (`focusWindow`/`closeWindow`/`floatWindow`/`togglePseudo`/`togglePin`/`toggleFullscreen`/`centerWindow`/`sendToWorkspace`/`toggleGroup`/…, all `hl.dsp.*` Lua via a private `_dispatch` that logs the offending call), `getClientJson(addr)` (one-shot raw `clients -j` read for fields AstalHyprland.Client lacks: `pinned`, `grouped` — on demand only, never in `_refresh`), `evalLua(call)` (live config changes — the Lua parser rejects `keyword`), `getOptionInt(name)` (sync) / `getOptionJson(name)` (async batch re-syncs), `setCursor(theme, size)`, `setRealCursorVisible(visible)` (`cursor:invisible`; rendering only, input unaffected — sole caller is the agent-pointer overlay, which hides the real pointer for the length of an AI action because the hardware cursor plane paints above every layer surface; **whoever hides it owns restoring it on every exit path**), `setGlow(enabled)` + `supportsGlow()` (`decoration:glow`, driven only by `AgentGlow.ts`), `version()`. **`focusWorkspaceFromShell(id)` is the single door for a workspace switch driven by one of OUR surfaces** (the app grid's strip, the island's overview) — it forwards to `focusWorkspace` today, and exists so those two cannot drift apart; its predecessor `focusWorkspaceOnGrabRelease` is DELETED, along with the EXCLUSIVE-era grab-lending it did (`tech-debt.md` §53). `restoreFocusAfterGrab()` is the one that still does real work: after our machinery lets go of a focus grab, the compositor refocuses by POINTER, so a dismissal with the cursor over the wallpaper leaves the session with no active window — it hands the keyboard back, guarded to fire only when nothing is focused and only on the workspace being looked at. Caches **effective** config AstalHyprland doesn't expose (`availableModesByName` — `Monitor.available_modes` is always null) and emits `config-reloaded` on Hyprland's `configreloaded` IPC event (effective-config consumers re-sync on it). Exempt from the single-door rule: config text *written for other daemons* (the hypridle config generated by Power.tsx — those lines execute outside the shell; the before/after-sleep hooks themselves are static scripts in `bin/`). |
 | `NightLightManager.ts` | 174 | Blue-light filter via hyprsunset (`night-light.json`). |
 | `WallpaperManager.ts` | 127 | Wallpaper + transitions via `awww` (`wallpaper`). Reads/merge-writes the JSON through `ui/lib/wallpaper.ts` (shared with the lockscreen, which paints its own copy — the schema reserves a per-surface `surfaces` block; see tech-debt "Wallpaper resolution is centralized"). |
 | `MonitorConfig.ts` | ~120 | Per-monitor mode/scale/rotation + VRR → `nidara-monitor.lua`. Applies at runtime via **`hyprctl eval "hl.monitor({...})"`** (see the Lua-parser note below). `applyMode`/`applyTransform` apply without persisting; `commit()` writes the .lua — used for the revert-safety dialog on resolution/rotation changes. |

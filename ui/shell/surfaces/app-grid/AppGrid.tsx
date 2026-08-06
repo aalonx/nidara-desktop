@@ -35,12 +35,18 @@ export interface AppGridPanelHandle {
     widget: Gtk.Widget
     onShow: () => void
     handleKey: (keyval: number) => boolean
-    setKeyboardModeCallback: (onExclusive: () => void, onDemand: () => void) => void
     setActive: (active: boolean) => void
     setVisible: (open: boolean, onDone?: () => void) => void
 }
 
-export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void): AppGridPanelHandle {
+export default function AppGridPanel(
+    monitor: Gdk.Monitor,
+    onClose: () => void,
+    /** Switch workspace WITHOUT this surface's focus grab undoing it — the dock owns
+     *  the grab, `HyprlandState.focusWorkspaceFromShell` owns the order. Never call
+     *  `hs.focusWorkspace` directly from here. */
+    switchWorkspace: (id: number) => void,
+): AppGridPanelHandle {
     // ── Search bar ─────────────────────────────────────────────────────────
     const searchEntry = new Gtk.Text({
         placeholder_text: t("app-grid.search.placeholder"),
@@ -141,7 +147,7 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
         // Click: switch workspace and move keyboard focus here
         const click = new Gtk.GestureClick()
         click.connect("released", () => {
-            hs.focusWorkspace(i)
+            switchWorkspace(i)
             focusWsSlot(i)
         })
         itemBox.add_controller(click)
@@ -291,10 +297,6 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
         return nameA.localeCompare(nameB)
     })
 
-    // Keyboard mode callbacks — wired by dock after construction
-    let _cbExclusive: (() => void) | null = null
-    let _cbDemand:    (() => void) | null = null
-
     // ── App widget factory ─────────────────────────────────────────────────
     const createAppWidget = (app: any): Gtk.Button => {
         const id = normId(app.entry || "")
@@ -400,7 +402,9 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
             menuPopover.connect("destroy", () => safeDisconnect(Theme, themeId))
             menuPopover.set_child(grid)
             menuPopover.set_parent(item)
-            menuPopover.connect("closed", () => { _cbExclusive?.() })
+            // Nothing to do on "closed": the popup evicted our focus grab when it
+            // opened, and FocusGrab notices the popover in this window's widget tree,
+            // SUSPENDS the lease and retakes it here by itself (common/FocusGrab.ts).
         }
 
         const layoutMenu = () => {
@@ -457,7 +461,6 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
             layoutMenu()
             menuDraw?.queue_draw()
             updateMenu()
-            _cbDemand?.()
             GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
                 menuPopover?.popup()
                 return GLib.SOURCE_REMOVE
@@ -661,7 +664,7 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
                     return true
                 }
                 if (keyval === Gdk.KEY_Return || keyval === Gdk.KEY_KP_Enter) {
-                    hs.focusWorkspace(wsNav)
+                    switchWorkspace(wsNav)
                     return true
                 }
                 // Backspace / printable char → back to search
@@ -719,11 +722,6 @@ export default function AppGridPanel(monitor: Gdk.Monitor, onClose: () => void):
                 return true
             }
             return false
-        },
-
-        setKeyboardModeCallback(onExclusive: () => void, onDemand: () => void) {
-            _cbExclusive = onExclusive
-            _cbDemand    = onDemand
         },
 
         setActive(active: boolean) {

@@ -5,6 +5,7 @@ import Cairo from "gi://cairo"
 import GLib from "gi://GLib"
 import { MorphRevealer } from "../../common/MorphRevealer"
 import { setVisibleRect } from "../../common/VisibleRegion"
+import { acquireFocusGrab, releaseFocusGrab } from "../../common/FocusGrab"
 import status from "../../core/Status"
 import inputYield from "../../core/InputYield"
 
@@ -59,17 +60,22 @@ export interface IslandWindowHandle {
     /** Root the revealers are anchored against — their `margin_top` is measured
      *  relative to this, exactly as it used to be against the bar's overlay. */
     root: () => Gtk.Widget
-    setKeyboardGrab: (grab: boolean) => void
-    /** Outside-click dismissal, which MUST live on this surface. A layer surface
-     *  holding an EXCLUSIVE keyboard grab also receives the pointer in Hyprland,
-     *  regardless of input regions — so while a `needsKeyboard` mode is open the
-     *  bar's own catcher never sees the click. That is why the overview and the
-     *  assistant stopped closing on outside click when the island moved out of
-     *  the bar's window, while the ambient player (no grab) kept working.
-     *  `topInset` keeps the bar strip live so clicking another bar capsule still
-     *  switches surfaces in ONE click; pass 0 for grabbing modes, where those
-     *  clicks cannot reach the bar anyway and should just dismiss. */
-    setCatcher: (open: boolean, topInset: number) => void
+    /** Take modality for an open island mode. There is no per-mode distinction to
+     *  make: a compositor focus grab carries keyboard AND pointer either way, so an
+     *  ambient mode gets dismissal and a keyboard mode gets keys from the same call.
+     *  (The old `needsKeyboard` argument existed only to pick EXCLUSIVE on the
+     *  layer-shell fallback, which died with the catchers.)
+     *
+     *  `peers` are other windows of ours that must stay clickable THROUGH the
+     *  grab — in practice the bar's, so capsule-to-capsule switching stays one
+     *  click. They are not a nicety: a press outside the whitelist is delivered to
+     *  the grabbed surface and then dismisses, so it never reaches what you
+     *  clicked (see common/FocusGrab.ts).
+     *
+     *  Returns whether the compositor grab took. There is no second mechanism to
+     *  fall back to, so a false is not a degrade — it is a surface nothing can
+     *  dismiss, and the caller is expected to say so loudly. */
+    setModal: (open: boolean, peers: (Gtk.Window | null)[]) => boolean
     /** Re-stamp the click-through mask: the capsule always, plus whatever mode
      *  is currently revealed. */
     updateInputRegion: () => void
@@ -137,10 +143,12 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
     // root-relative and monitor-relative coordinates has to add it.
     let topOffset = 0
 
-    // Mirrors the bar's own catcher, on this surface — see setCatcher's doc.
-    const catcher = new Gtk.Button({ css_classes: ["overlay-catcher"], visible: false, hexpand: true, vexpand: true })
-    catcher.connect("clicked", () => { status.island_mode = "" })
-    let catcherTop: number | null = null   // null = off
+    // Our ownership token for the compositor focus grab that IS this surface's
+    // modality, 0 when we hold none — see setModal and common/FocusGrab.ts. A token rather
+    // than a boolean because the BAR grabs the same single slot: it can evict us
+    // between our own open and close, and a release we no longer own would take
+    // down ITS grab.
+    let grabToken = 0
 
     const updateInputRegion = () => {
         const surface = win.get_native()?.get_surface()
@@ -177,19 +185,6 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
         // currently revealed.
         for (const t of hitTargets()) add(t)
         for (const r of revealers) add(r)
-        // The catcher's rect is stamped EXPLICITLY rather than measured: it is
-        // shown and stamped in the same turn, so its allocation is still a layout
-        // pass behind. (Same reason the bar unions its own catcher rect by hand.)
-        if (catcherTop !== null) {
-            // Height is the SURFACE's, not the monitor's: a top offset shortens us
-            // by that much, and a rect past the surface would just be clipped.
-            // @ts-ignore
-            region.unionRectangle({
-                x: 0, y: catcherTop,
-                width: Math.round(monGeo.width),
-                height: Math.round(monGeo.height - topOffset - catcherTop),
-            })
-        }
         surface.set_input_region(region)
         updateVisibleRegion()
         win.queue_draw()   // input regions are double-buffered: apply on next commit
@@ -275,8 +270,7 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
     }
 
     // What the island actually COVERS, monitor-relative — capsule plus whichever
-    // mode is revealed, which is exactly what `updateInputRegion` stamps minus the
-    // catcher (the catcher is a dismissal target, not something the user can see).
+    // mode is revealed, which is exactly what `updateInputRegion` stamps.
     //
     // This exists for the AGENT, not for layout. The Assistant lives in this island
     // and was happily clicking controls that sit UNDERNEATH it: the click lands
@@ -321,10 +315,16 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
         mount: (row, targets, mounted) => {
             hitTargets = targets
             revealers = mounted
+            // A mode's rect enters the input region from the layout pass that
+            // gives the revealer an allocation — NOT from the turn that revealed
+            // it, where it still has none. Before the focus grab that gap was
+            // covered by the catcher's hand-written full-screen rect; without it,
+            // a click inside a freshly opened mode fell through to whatever was
+            // behind, which the compositor reads as a press outside the grab and
+            // dismisses. That is the "island doesn't take mouse input when it
+            // opens" symptom, and it lasted the whole 300ms morph.
+            for (const r of mounted) r.onAllocated = updateInputRegion
             root.add_overlay(row)
-            // Between the capsule and the modes: later overlay children paint on
-            // top, so the catcher must never sit above a revealed mode.
-            root.add_overlay(catcher)
             for (const r of mounted) root.add_overlay(r)
             // Present once, and stay mapped: the capsule is permanent furniture
             // now. Deferred like the bar's own present so the first frame has a
@@ -338,18 +338,32 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
                 return GLib.SOURCE_REMOVE
             })
         },
-        setKeyboardGrab: (grab) => {
-            try {
-                Gtk4LayerShell.set_keyboard_mode(win, grab
-                    ? Gtk4LayerShell.KeyboardMode.EXCLUSIVE
-                    : Gtk4LayerShell.KeyboardMode.NONE)
-            } catch (e) { console.error("[IslandWindow] keyboard mode failed:", e) }
-        },
-        setCatcher: (open, topInset) => {
-            catcherTop = open ? Math.max(0, Math.round(topInset)) : null
-            catcher.margin_top = catcherTop ?? 0
-            catcher.set_visible(open)
-            updateInputRegion()
+        setModal: (open, peers) => {
+            const want = open && !inputYield.active
+
+            if (want && !grabToken) {
+                grabToken = acquireFocusGrab(
+                    [win, ...peers],
+                    () => {
+                        grabToken = 0
+                        // Close ONLY what this surface owns. An eviction can come from
+                        // the BAR taking the slot for one of its own overlays, and
+                        // reaching further than island_mode would then close whatever
+                        // the other surface just opened.
+                        status.island_mode = ""
+                    })
+                if (!grabToken) console.error("[IslandWindow] focus grab REFUSED — this surface has no modality: nothing dismisses it and its keyboard modes cannot be typed into.")
+            } else if (!want && grabToken) {
+                releaseFocusGrab(grabToken)
+                grabToken = 0
+            }
+
+            // Layer-shell interactivity is NEVER touched here: it is set to NONE once
+            // at construction and stays there. The grab carries the keyboard, and
+            // asking for EXCLUSIVE on top would put this surface back in
+            // m_exclusiveLSes — the list that makes Hyprland refuse to move window
+            // focus at all (core/InputYield) — buying nothing.
+            return grabToken !== 0
         },
         updateInputRegion,
         setShown: (shown) => {
@@ -366,7 +380,7 @@ export function IslandWindow(gdkmonitor: Gdk.Monitor): IslandWindowHandle {
             try { Gtk4LayerShell.set_margin(win, Gtk4LayerShell.Edge.TOP, v) }
             catch (e) { console.error("[IslandWindow] top margin failed:", e) }
             // The input region is stamped in surface coordinates; the surface just
-            // moved, so the catcher's hand-written rect has to be re-cut.
+            // moved, so every rect in it has to be re-cut.
             updateInputRegion()
         },
     }
