@@ -75,19 +75,42 @@ owns three decisions:
 - `NIDARA_VISIBLE_REGION=0` disables the optimisation everywhere. Keep this working: the failure
   mode above is a missing piece of desktop, so a user who hits it needs a bootable shell before they
   can report anything, and `systemctl --user set-environment` is reachable from a TTY.
+- It speaks **many rects** (`setVisibleRects`; `setVisibleRect` is the one-rect convenience).
+  `wl_region_add` is additive and Hyprland iterates the clip region rather than its bounding box, so
+  N rects cost their own area, not their union's — which is what lets the bar declare "strip PLUS
+  the open panel" instead of giving the surface back. ⚠️ **`[]` and `null` both mean CLEAR, on
+  purpose, and that is NOT what the protocol says**: a genuinely empty `wl_region` is a surface that
+  draws nothing. Nobody wants that as the answer to "I could not measure anything", so the wrapper
+  will not produce it — say `null` to mean "I don't know" and get the whole surface.
 
 **Every blurred layer declares a region today** — `DockAxis.ts` (both axes), `IslandWindow.ts`,
-`Bar.tsx` and `AppGridWindow.ts` — and they split into **three rules**, one per shape of the
+`Bar.tsx` and `AppGridWindow.ts` — and they split into **four rules**, one per shape of the
 question "do I know what I paint before I paint it?".
 
 - **The dock knows its silhouette before it paints**, so it declares in every state, hidden
   included. Since 2026-08-09 that is literally every state: the two branches that used to hand the
   whole surface back — an open app grid, and a yield — are gone, the first because the grid moved
   out and the second because it was only ever justified by the grid.
-- **The island and the bar cannot**: their content arrives through a `MorphRevealer`/`ScaleRevealer`,
-  and a widget just made visible has no allocation until the next layout pass — so they declare
-  **only at rest** and hand the whole surface back the instant anything is revealed or still
-  animating (`get_visible()` is not enough on the way out; `tickId` is what says "still moving").
+- **The island cannot**: its modes arrive through a `MorphRevealer`, which has no final allocation
+  until the morph lands — so it declares **only at rest** as the compact capsule and hands the whole
+  surface back the instant anything is revealed or still animating (`get_visible()` is not enough on
+  the way out; `tickId` is what says "still moving").
+- **The bar declares `strip + one rect per open panel`** (2026-08-09). It used to follow the
+  island's rule, and that was the island's answer to a question the bar does not have: its five
+  panels are `ScaleRevealer` + `OVERLAY_POP` with `animateLayout: false`, so — exactly like the app
+  grid below — the allocation is FINAL from the first laid-out frame and the pop paints inside it.
+  🔑 **What makes per-panel rects safe is `onAllocated`**, which `ScaleRevealer` fires from inside
+  `size_allocate`, i.e. before the snapshot of the same frame: however stale the bounds were when
+  the open path stamped, the panel's real rect lands on the very frame that first paints it. That
+  hook is now wired by **walking `masterOverlay`**, like the rect predicate itself — a hand-list that
+  missed a panel added later used to cost a late click and would now cost a panel that is not drawn.
+  The one path that still hands the whole surface back is the notification banners, and only between
+  `onContentAppeared` (synchronous, on append) and the deferred stamp that follows their grow-in —
+  the window in which the box's bounds describe the *previous* stack. Their band is declared
+  **full monitor width** because a swipe-to-dismiss flips the revealer to `overflow: VISIBLE` and
+  flings the card clear off screen: it is the one thing in that window that paints outside its own
+  box, everywhere else GTK's `overflow: HIDDEN` on the revealer clips for us before the compositor
+  sees anything.
 - **The app grid is the third case: it declares only while OPEN, and does not exist otherwise.** It
   has the same no-allocation-yet problem, but two properties the island lacks let it declare
   anyway. Its revealer is `OVERLAY_POP` with `animateLayout: false`, so the allocation is the FINAL
@@ -112,10 +135,45 @@ question "do I know what I paint before I paint it?".
   rect there makes a monitor-sized surface eat every click on screen. Same principle both times —
   fail towards invisible.
 
+#### Deciding the shape of a FIFTH blurred surface
+
+Those four are what exists, not a menu. For a new one, **do not start from "should this layer be
+full-screen"** — once a surface declares a region that question stopped being about performance.
+§46 measured the cost as tracking the *intersection* of the damage with the declared region,
+monotonically: a full-screen blurred layer is +5.9 pts, the same layer declaring a 400x60 region is
+**+0.7**. The box became a layout decision. Ask these three, in order:
+
+1. **Can it be UNMAPPED most of the time?** Then give it its own surface and unmap it. An unmapped
+   surface has no blur pass at all — **zero beats small**, and no region can match that. This is the
+   app grid, and it is why the grid's own answer is not "declare better" but "not be there".
+2. **Can it always answer "what am I painting" before it paints it?** Then full-screen is fine;
+   declare a region and move on. Dock, bar, app grid.
+3. **Can it NOT answer?** This is the only case where the surface's BOX is still the cost, because
+   an unanswerable frame hands the whole box back. Then — and only then — ask whether a **fixed**
+   smaller box is possible. ⚠️ **Fixed, never resizing**: §46 ruled out dynamic sizing, and the
+   artefact tracked the RESIZE, so a box set once at map time and never changed does not hit it.
+   Nobody has tried that; it is the one unexplored option here. It would only pay for the island,
+   whose expanded modes are near-monitor anyway, which is why it stays unexplored.
+
+Two things the region does not buy, so do not plan around them:
+
+- **A floor of ~1 pt per mapped blurred layer**, however small the region — the blur samples past
+  its edge, so what you pay for is the region expanded by the radius. The lever there is the NUMBER
+  of mapped blurred layers, not their size. Five namespaces carry a `blur` rule today (bar, island,
+  dock, app grid, lock); at rest only three are mapped.
+- **Nothing, if the surface really does paint everything.** `nidara-lock` is full-screen and blurred
+  and should declare nothing at all. Declaring is for surfaces that paint far less than they occupy.
+
 🔑 **Before wiring a region to the same call sites that stamp the input
 region, re-read each one asking "can this arrive late?"** — a late input stamp costs a late click, a
 late visible stamp is a frame that is never drawn. That question is what found the notification
 banners' deliberately-deferred stamp in `NotificationPopups.tsx` (§46).
+
+🔑 **What the 2026-08-09 measurement settled beyond GPU points:** the bar is full-screen *only*
+because commandment 5 puts every overlay inside its window. Until the panels were declared, the
+honest reading was that the commandment carried a real GPU price every time anything opened. It does
+not any more — an open Control Center measures at the no-panel baseline. Weigh that before treating
+the coupling as debt.
 
 ### Window capture — real thumbnails, one render pass each
 
