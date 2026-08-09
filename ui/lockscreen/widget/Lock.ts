@@ -5,17 +5,24 @@ import LockCard from "./LockCard"
 import PowerBar from "./PowerBar"
 import Clock from "./Clock"
 import { resolveWallpaper } from "../../lib/wallpaper"
+import { setCapsuleBackdrop } from "../../lib/glass-capsule"
 
 function buildWindow(onUnlock: () => void): Gtk.ApplicationWindow {
   const win = new Gtk.ApplicationWindow({
     application: app,
-    css_classes: ["greeter-window"],
+    // The second class scopes the "capsules are painted, not CSS-drawn"
+    // overrides to the lockscreen: the greeter shares this stylesheet but has
+    // no painter (it gets compositor blur and keeps the CSS glass).
+    css_classes: ["greeter-window", "nidara-lock-window"],
   })
 
   // The lockscreen runs inside the locked user's session, so its own config
   // dir is the right source — never getDefaultUser(), which points at the
   // first /etc/passwd user and reads the wrong home on multi-user machines.
   const wallpaperPath = resolveWallpaper("lockscreen")
+  // Same image the glass elements blur behind themselves — they must show the
+  // wallpaper that is actually on screen, not a second one.
+  setCapsuleBackdrop(wallpaperPath)
   const fill: Gtk.Widget = wallpaperPath
     ? (() => {
         const pic = new Gtk.Picture({ hexpand: true, vexpand: true, content_fit: Gtk.ContentFit.COVER })
@@ -40,6 +47,15 @@ function buildWindow(onUnlock: () => void): Gtk.ApplicationWindow {
 
   const overlay = new Gtk.Overlay()
   overlay.set_child(fill)
+
+  // Wallpaper scrim — the hero text has no glass behind it and vanishes on a
+  // light wallpaper. `can_target: false` is load-bearing: a full-size child of a
+  // Gtk.Overlay takes input by default, so without it this box would swallow
+  // every click meant for the card below.
+  const scrim = new Gtk.Box({ hexpand: true, vexpand: true, css_classes: ["greeter-scrim"] })
+  scrim.set_can_target(false)
+  overlay.add_overlay(scrim)
+
   overlay.add_overlay(clockWidget)
   overlay.add_overlay(lockCard)
   overlay.add_overlay(powerBar)

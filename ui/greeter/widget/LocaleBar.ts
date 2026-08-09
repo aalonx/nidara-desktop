@@ -1,4 +1,6 @@
 import { Gtk } from "ags/gtk4"
+import { ndImageProps } from "../../lib/icons"
+import { withGlassCapsule } from "../../lib/glass-capsule"
 import { execAsync } from "ags/process"
 import { getLocale, setLocale, type Locale } from "../lib/i18n"
 import { greeterPrefs, savePrefs } from "../lib/greeter-prefs"
@@ -100,7 +102,7 @@ export default function LocaleBar(): Gtk.Widget {
   })
 
   // ── Layout: [⌨ kbDrp] [sep] [langDrp] ─────────────────────────────────────
-  const kbIcon = new Gtk.Image({ icon_name: "input-keyboard-symbolic", pixel_size: 12 })
+  const kbIcon = new Gtk.Image(ndImageProps("keyboard", "input-keyboard-symbolic", 12))
   kbIcon.add_css_class("locale-bar-icon")
 
   const row = new Gtk.Box({
@@ -114,5 +116,9 @@ export default function LocaleBar(): Gtk.Widget {
   row.append(new Gtk.Separator({ orientation: Gtk.Orientation.VERTICAL, css_classes: ["locale-bar-sep"] }))
   row.append(langDrp)
 
-  return row
+  // Painted like every other capsule on these two screens. This one carried the
+  // OTHER failure mode of a CSS pill — `border-radius: pill` with a visible 1px
+  // border puts the two arcs of each cap exactly tangent, and GTK leaves one
+  // brighter pixel right there. Greeter-only widget, but the shape is shared.
+  return withGlassCapsule(row)
 }

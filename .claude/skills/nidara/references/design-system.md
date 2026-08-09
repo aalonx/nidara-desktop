@@ -211,9 +211,9 @@ separate job (a ratio of the bitmap's own size, painted by `squircleThumb()`), a
 are not rungs — see `tech-debt.md` #48 for the three that currently disagree. Cairo cannot read a CSS var — a corner that clips has
 to be known in px — so the duplication is deliberate and labelled. **There are no radius
 literals left in TS/TSX, nor in `ui/shell/styles/*.scss`** (use `$nidara-radius-*`, the SCSS
-alias of the same vars); that is the invariant to re-check when adding a surface. The greeter
-and lockscreen bundles carry their own standalone stylesheets and are NOT covered — they do
-not import the token layer at all (see `tech-debt.md`).
+alias of the same vars); that is the invariant to re-check when adding a surface. **Since
+2026-08-09 the greeter and lockscreen are covered too** — see "The design system reaches the
+greeter and the lockscreen" below.
 
 | Token | px | What wears it |
 |---|---|---|
@@ -466,7 +466,33 @@ out on purpose, the exception belongs beside the blanket.
 
 🔑 **Focus is not one affordance.** A control styled as an INPUT (the dropdown trigger, the text
 inputs) shows keyboard focus as its 2px border going accent — no ring. A BUTTON shows a ring
-(`nidara-focus-ring`). One control must never show both.
+(`nidara-focus-ring`, now in `ui/lib/styles/_tokens.scss` so all three bundles share it). One
+control must never show both.
+
+⚠️ **`outline` follows the widget's OWN `border-radius`, so declare the radius on the BASE
+rule — not only on the states that paint something.** A widget whose box is painted behind it
+(the greeter/lock capsules) draws nothing at rest, which makes it natural to put the radius
+under `:hover`/`:active` where a fill actually appears. Then the focus ring comes out a
+rounded RECTANGLE around a pill (user-caught 2026-08-09 on the unlock button, reproduced
+offscreen). **The hover fill and the focus ring are two consumers of one number.** When
+sweeping, the check is: every `@include nidara-focus-ring` consumer must have a
+`border-radius` outside its state blocks.
+
+⚠️ **A focusable control with NO focus rule does not get "no ring" — it gets GTK's own.**
+GTK4's built-in fallback CSS draws a blue `outline`, which ignores the user's accent entirely.
+That is why the greeter/lock sheet says `outline: none` on every control before declaring its
+own state, and why the user chip and the dropdown triggers were quietly showing a second ring
+vocabulary until 2026-08-09. Adding a control to these surfaces means adding both halves.
+
+The greeter and lockscreen broke this in both directions until 2026-08-09 and the symptom the
+user reported was neither rule: the focus just looked **dull**. The unlock button drew an
+accent border AND a halo (both affordances), and every ring on those two surfaces was
+`rgba(accent, 0.35)` rather than solid — a 35 % ring reads as "something is slightly different
+here" instead of "your keystrokes go here". **A tinted focus ring is not a softer focus ring,
+it is a weaker signal**; if it looks too loud at full strength, the control is wrong, not the
+alpha. On the lock the input's accent edge is the painted rim (`followFocus: true`), which is
+also why only the entry passes that flag — a container reports `FOCUS_WITHIN` for any child,
+so passing it on the power bar paints the whole bar accent when one button inside has focus.
 
 ### A vertical inset on a SCROLLABLE list is viewport, not air
 
@@ -568,9 +594,46 @@ belongs to a small dedicated element next to the neutral text, or to a filled ba
 | Battery critical | the battery glyph's fill | plain white `%` |
 | Recording active (island compact, CC badge) | the 8px dot | `--nidara-text` |
 
-Rejected three times now (battery `%` 2026-07-20, assistant errors 2026-07-21, the capture card's
-and detail page's clock 2026-08-02 — all three caught by the user's eye), which is why it is a rule
-and not a preference. Corollary already documented below: once a capsule fills with a semantic
+Rejected four times now (battery `%` 2026-07-20, assistant errors 2026-07-21, the capture card's
+and detail page's clock 2026-08-02, the greeter's caps warning 2026-08-09 — all four caught by the
+user's eye), which is why it is a rule and not a preference.
+
+⚠️ **"Not in the copy" does NOT mean "therefore a dot" — a mark has to EARN its place, and
+there are exactly two ways.** Settled with the user 2026-08-09, after a warning dot on the
+greeter's caps message shipped for an hour and was removed:
+
+1. **It SUBSTITUTES for text there is no room for.** `.island-rec-dot` and `.bar-cc-badge`:
+   a compact island capsule cannot say "recording", a bar icon button cannot say "the AI has
+   permissions". The dot is the only thing that fits, so it carries the whole message.
+2. **It DISCRIMINATES between items that otherwise look identical.** `.agent-tool-dot` /
+   `.agent-error-dot`: the assistant's transcript is a list of steps rendered the same way, and
+   the dot is what separates the ones that failed from the ones that worked. Remove it and you
+   cannot tell them apart at a glance. This is the case the "no room" reading misses — there IS
+   room next to a tool name; the dot is not there for space, it is there for contrast within a
+   set.
+
+**A single self-describing sentence is neither.** The greeter's caps warning says what it
+means, in words, and appears alone; a dot beside it repeats the sentence. That is decoration.
+**When the copy already carries the meaning, removing the colour is the entire change** — what
+makes the message noticeable is the capsule it sits on.
+
+The user's own framing, worth keeping because it is the test that scales: *"in the agent it
+makes sense because it marks errors and tells them apart from the correct steps. Here the text
+is enough."* Before adding a mark, name which of the two jobs it is doing. If the answer is
+"it makes it stand out", it is decoration.
+
+⏸️ **If that message ever does need something, the candidate is an ICON, not a dot** — an
+informational glyph, because the thing being communicated is a *kind* of state rather than a
+severity. Deferred by the user 2026-08-09: text alone for now.
+
+🔑 **The fourth rejection adds a reason the first three did not have: on an arbitrary backdrop a
+mid-tone hue is WORSE than plain white, not merely louder.** The greeter's caps warning was
+`--nidara-warning` type sitting directly on the wallpaper, and on a light one it read worse
+than the neutral text beside it — a saturated mid-tone has nowhere to go when the background
+can be anything, which is exactly the argument that had already talked `.greeter-error` out of
+red on the same screen. Where the shell's version of this rule is about *taste* (red type on
+glass shouts), the greeter's is about *legibility*. Same conclusion, and on the surfaces that
+sit on the user's own photograph it is the stronger of the two arguments. Corollary already documented below: once a capsule fills with a semantic
 colour, do NOT tint the label on top of it as well.
 
 ### And the red BUDGET is smaller than that (2026-08-02, user call: "se tiende a abusar del rojo")
@@ -755,6 +818,173 @@ captures over a real *light* wallpaper through Hyprland's actual blur: the halo 
 stair-stepped curves were clearly visible. So AA wins. The border/rim strokes
 (steps 2-3) still clip to the path so their inner AA can't spill outward. **Don't
 "fix" this back to NONE** thinking AA causes a halo — it was checked on real pixels.
+
+## A CSS pill at `--nidara-radius-pill` seams at the middle of each cap
+
+`--nidara-radius-pill` is `9999px`, and GTK clamps it to **exactly half the
+height**. That makes the two corner arcs of each side meet at a single tangent
+point with no straight segment between them, and GTK's border rendering leaves
+**one brighter pixel right in the middle of each cap** — a "dot" on the left and
+right edges of the capsule. Only bites CSS-drawn pills with a visible hairline
+border (Cairo capsules draw their own path and are unaffected).
+
+Reproduced offscreen 2026-08-09 (user-caught on the lockscreen): **visible at an
+odd height, clean at an even one**, because half of an odd height lands
+mid-pixel. Parity is not something we can guarantee — fractional display scaling
+turns any logical height into whatever it likes — and `box-shadow: inset` instead
+of `border` seams identically (tried).
+
+The fix, applied to the greeter/lock pills in `ui/greeter/style.scss`: an
+explicit **even `min-height`** (vertical padding zero, so the shape comes from a
+number we control rather than font metrics) and a **radius one pixel under
+half**. The arcs are then joined by a 2px straight edge and never become tangent,
+at any scale. Any widget painting a backdrop inside such a pill
+(`ui/lockscreen/widget/GlassBackdrop.ts`) must clip to the SAME radius, or its
+fill spills past the border at the caps.
+
+✅ **CLOSED 2026-08-09 — both surfaces PAINT their capsules** (`ui/lib/glass-capsule.ts`,
+lifted out of the lockscreen bundle). Everything below is the record of why CSS could not do
+it, because the number was argued from both sides twice.
+
+⚠️ **"Still a pill to the eye" was wishful — the straight edge IS visible, and
+the trade is not free.** Rendered and magnified 2026-08-09 with
+`scripts/dev/lock-probe.js` after the user reported a flat run on the caps and
+the note went down as "does not add up": on the 42px password field and unlock
+button, a 20px radius shows an unmistakable vertical run in the middle of each
+cap. Both readings were right, of different surfaces — **the LOCKSCREEN paints
+its capsules** (`GlassBackdrop` uses `min(w,h)/2`, a true pill, and its rim is a
+FILL rather than a border primitive, so it has neither defect), **the GREETER is
+still CSS** and wears the flat. So the honest state is: the CSS route has two
+failure modes and no good setting between them — a dot at exactly half, a flat
+segment one under — and the only shape that is actually a capsule is a painted
+one. Painting the greeter's capsules the way the lockscreen already paints its
+own is the open fix; do NOT relitigate the radius number, it has been tried from
+both sides.
+
+## The design system reaches the greeter and the lockscreen (2026-08-09)
+
+Before this, `ui/greeter/style.scss` — the sheet **shared** by the greeter and the
+lockscreen — opened with its own `* { }` block re-typing the radii and the palette, and
+carried eleven freehand `font-size` values with no ramp behind them. Nothing was broken; it
+had simply stopped moving. Every design-system decision taken in the shell had to be
+re-typed here to arrive, and none ever was, so the surfaces drifted one generation at a
+time. The tell was arithmetic: the date sat at **13px under an 88px clock**, a 1:6.8 ratio
+outside every system that ships a lock screen (macOS 1:4.8, iOS 1:4.4, Win11 1:3.7, GNOME
+1:3.4) — two numbers nobody had ever chosen together.
+
+**`ui/lib/styles/_tokens.scss` is now the mode-independent half of the system**, `@use`d by
+both `ui/shell/styles/_base.scss` (which `@forward`s it, so every `@use 'base' as *` keeps
+seeing the same names) and `ui/greeter/style.scss`. It holds the type ramp, the weights, the
+line heights, the spacing scale, the motion curves and the radius ladder.
+
+Three rules for extending it:
+
+- **Nothing in that file may emit CSS at import time**, and every comment is `//`, not
+  `/* */` (sass copies loud comments into the output). The radius custom properties go
+  through a **`@mixin radius-vars`** so each bundle includes them inside its OWN `*` block
+  instead of getting a second one. That is what let the extraction be verified the way a
+  pure refactor should be: compile `style.css` before and after and diff — the shell's came
+  back **identical but for comments**, zero declarations moved.
+- **What stays per-bundle is the PALETTE**, and for a real reason: the shell rewrites its
+  colour tokens at runtime per light/dark mode (`NidaraTheme.generateTokensCss`), while the
+  greeter and lockscreen are permanently dark glass over a wallpaper. So they take the
+  shell's **dark set** as literal values. They had been a near-miss copy of it — `0.70/0.45`
+  against the shell's `0.80/0.55`, and a local name (`--nidara-text-muted`) for what the
+  shell calls `-dim` — which made secondary text a step darker on the one surface with no
+  card behind it.
+- **A token with two representations gets labelled as a mirror, on both sides.** The glass
+  palette now lives as numbers in `ui/lib/tokens.ts` (`LOCK_GLASS`) because the lockscreen
+  PAINTS its capsules and Cairo/GSK cannot read a custom property — the same constraint that
+  produced the radius ladder's double life. What was wrong before was not the duplication,
+  it was that one half was three literals at the top of a painter with only a comment tying
+  them to the sheet.
+
+**The hero clock is the DISPLAY register, not a rung.** `$fs-display: 88px` / `$fw-display:
+200` are named and documented as having exactly one consumer in the DE. This is not the ramp
+continued — macOS, GNOME and Windows all set their lock clock outside the UI type scale too —
+and `$fw-display` is the single exception to the four weights. **If a second consumer ever
+appears, that is when it becomes a ramp; not before.** Everything else on these two surfaces
+lands on `$fs-*` exactly: eight of the eleven freehand sizes were already 12/13/14 and simply
+needed the token; only the hero block was genuinely off-system (date 13→`$fs-title-3`,
+username 20→`$fs-title-3`, both `$fw-semibold`).
+
+**Icons too.** The power bar asked the icon THEME for `system-shutdown-symbolic` /
+`system-reboot-symbolic` / `media-playback-pause-symbolic` — the same three actions the
+shell's system menu draws with `Icons.power` / `rotateCcw` / `moon`. On a clean Arch box that
+is Adwaita's art, so Nidara's own login and lock screens were the one place in the DE not
+using Nidara's icons (commandment 10). **`ui/lib/icons.ts`** resolves the shipped set for
+bundles that have no `core/`, by the same route `avatar.ts` already used
+(`NIDARA_SHELL_ROOT ?? /usr/share/nidara/ui/shell`), and falls back to the theme name rather
+than throwing — a missing icon must cost an icon, never the login screen. They are Lucide
+SVGs, not symbolic, so the consumer **must** add `nd-icon`; the sheet now carries that rule
+once instead of stapled to the avatar fallback.
+
+### The capsule is PAINTED, on both surfaces — and the rim has to be a RING
+
+`ui/lib/glass-capsule.ts` (`withGlassCapsule`) is the one capsule of the greeter and the
+lockscreen. It draws the body inside a rounded clip at radius exactly `min(w,h)/2` — a true
+pill, which CSS cannot deliver (see the tangency section above: a dot at half, a flat run one
+under, no third setting) — and the rim as a **1px ring, filled through an even-odd Cairo path**,
+never stroked and never a border primitive.
+
+**The only difference between the two surfaces is where the pixels behind the glass come
+from, and that is a property of the compositor rather than a design decision.** The greeter is
+a transparent layer whose `layer_rule` blurs whatever is below, so it passes no backdrop and
+its body is fill-only. The lockscreen gets no compositor blur at all (`ext-session-lock-v1`
+blanks everything behind the lock surface), so it calls `setCapsuleBackdrop(wallpaper)` and the
+painter renders the blurred copy itself, once, into a texture.
+
+🔑 **The bug that asymmetry hid, and the reason the ring matters.** The first version filled
+the *whole* outer pill with the rim colour and painted the body over it. That is invisible for
+as long as the body is opaque — and on the lock it is, because the blurred texture covers the
+rim. The greeter paints no texture, so its body is a 55 % tint, and the rim came straight
+through: **the entire capsule rendered accent blue the moment it took focus.** It could not
+have been found by reading the code, and it was not in the lock's own rendering either. It
+appeared on the first offscreen render of the textureless case. When one consumer of a painter
+is opaque and another is not, render the transparent one.
+
+### Bare text on the wallpaper: the scrim, and the 0.3 ceiling that governs it
+
+The hero date, the clock and the username are the only text on either screen with **no glass
+behind them**, and on a light wallpaper they do not dim — they vanish. Rendered on an
+87 %-luminance backdrop (2026-08-09), the entire hero block was gone.
+
+**The obvious fix was the weakest of five candidates.** A text shadow outlines the glyph
+without raising the contrast underneath it, so the hero went from invisible to *ghostly*. What
+works is a **scrim** lifting the background contrast plus a shadow doing the edge — which is
+also what the field does: GNOME, Windows 11 and iOS all scrim their lock wallpaper, macOS
+leans on a shadow with a slight dim, and none of the four leaves the text bare. The gradient
+is stronger at the ends (where the clock and the power bar live) and lighter through the
+middle, so the wallpaper survives where nothing has to be read over it.
+
+🔑 **The 0.28 peak is not a taste value — it is what keeps the two screens identical, and it
+is the single most useful number to know about this pair.** The greeter is a *transparent*
+layer over awww's wallpaper carrying `blur = true, ignore_alpha = 0.3`
+(`config/greetd/hyprland-greeter.lua`); the lockscreen paints its *own* wallpaper and gets no
+compositor blur at all. **So any pixel of ours above 0.3 alpha has blurred wallpaper behind it
+on the login screen and sharp wallpaper on the lock screen.** Two surfaces, one stylesheet,
+same declaration, different result — and nothing warns you. That ceiling is why the shadow
+cannot simply be made stronger (a convincing one wants 0.5–0.6), and it is the first thing to
+check before adding any translucent element to this sheet.
+
+⚠️ A full-size child of a `Gtk.Overlay` **takes input by default**. The scrim sets
+`can_target: false` in both bundles; without it, it swallows every click meant for the card.
+
+### Looking at these two surfaces: `scripts/dev/lock-probe.js`
+
+They are the only surfaces in the DE you cannot see while working on them — the shell
+reloads with `Super+Shift+R`, but seeing the lockscreen means locking the session you are
+editing from. That is why they drifted, and why a 2026-08-09 session ended with the *user*
+acting as the render loop and finding four defects by eye.
+
+`lock-probe.js` builds the real widget tree with the real stylesheet and writes a PNG, plus
+the bounds of the hero block and the measured date:clock ratio. Point `CSS=` at two builds
+for a before/after pair, and run it at least twice with different `BG=` — **legibility here
+is a question about the WALLPAPER**, and that is exactly what it caught: on a light backdrop
+the date, the clock and the username all wash out, because they are the only text on the
+screen with no glass behind it. Read its header before trusting a number: it does not show
+blur, the painted rim, or `:focus-visible`, and on a tiling compositor the window size is a
+request, so **crop from the bounds it prints, never from a remembered offset**.
 
 ## Cairo vs CSS
 
