@@ -14,6 +14,7 @@ export class UIStatus extends GObject.Object {
                 "cc-open": GObject.ParamSpec.boolean("cc-open", "CC Open", "Control Center visibility", GObject.ParamFlags.READWRITE, false),
                 "nc-open": GObject.ParamSpec.boolean("nc-open", "NC Open", "Notification Center visibility", GObject.ParamFlags.READWRITE, false),
                 "prism-open": GObject.ParamSpec.boolean("prism-open", "Prism Open", "Prism Search visibility", GObject.ParamFlags.READWRITE, false),
+                "app-grid-open": GObject.ParamSpec.boolean("app-grid-open", "App Grid Open", "App grid visibility", GObject.ParamFlags.READWRITE, false),
                 "notif-active": GObject.ParamSpec.boolean("notif-active", "Notif Active", "Popups visibility", GObject.ParamFlags.READWRITE, false),
                 "settings-open": GObject.ParamSpec.boolean("settings-open", "Settings Open", "Settings window visibility", GObject.ParamFlags.READWRITE, false),
                 "cc-edit-mode": GObject.ParamSpec.boolean("cc-edit-mode", "CC Edit Mode", "CC edit mode active", GObject.ParamFlags.READWRITE, false),
@@ -30,6 +31,7 @@ export class UIStatus extends GObject.Object {
     private _cc_open = false
     private _nc_open = false
     private _prism_open = false
+    private _app_grid_open = false
     private _notif_active = false
     private _settings_open = false
     private _cc_edit_mode  = false
@@ -49,6 +51,7 @@ export class UIStatus extends GObject.Object {
         _cc_open: "cc-open",
         _nc_open: "nc-open",
         _prism_open: "prism-open",
+        _app_grid_open: "app-grid-open",
         _system_menu_open: "system-menu-open",
     }
 
@@ -112,6 +115,20 @@ export class UIStatus extends GObject.Object {
         this.notify("prism-open")
     }
 
+    // The app grid was NOT an overlay here until 2026-08-09: it lived inside the
+    // dock's window as a closure flag, because opening it also REVEALED the dock.
+    // That coupling was traded away for a surface of its own (see
+    // surfaces/app-grid/AppGridWindow.ts), and with it gone there was nothing left
+    // keeping the grid outside the exclusion — it could sit open behind the Control
+    // Center, which was listed as an accepted wart rather than a decision.
+    public get app_grid_open() { return this._app_grid_open }
+    public set app_grid_open(v: boolean) {
+        if (this._app_grid_open === v) return
+        this._app_grid_open = v
+        if (v) this.closeExclusive("_app_grid_open", { notif: true, barExpanded: true })
+        this.notify("app-grid-open")
+    }
+
     public get settings_open() { return this._settings_open }
     public set settings_open(v: boolean) {
         if (this._settings_open === v) return
@@ -146,8 +163,15 @@ export class UIStatus extends GObject.Object {
         this.notify("island-mode")
     }
 
+    // "Is the user looking at something of ours right now." The app grid counts
+    // (added 2026-08-09 with the rest of its move into Status), and leaving it out
+    // was not cosmetic: it is the FIRST line of the bar's empty-strip dismissal
+    // handler, so the strip silently stopped dismissing the grid while it dismissed
+    // every other overlay from the same pixel. Its other caller is AgentService,
+    // which used it to avoid popping the island over something the user opened —
+    // and had been popping it over an open app grid all along.
     public get isAnyOverlayOpen(): boolean {
-        return this._cc_open || this._nc_open || this._prism_open || this._system_menu_open || this._island_mode !== "" || this._bar_expanded_id !== ""
+        return this._cc_open || this._nc_open || this._prism_open || this._app_grid_open || this._system_menu_open || this._island_mode !== "" || this._bar_expanded_id !== ""
     }
 
     public get about_open() { return this._about_open }
