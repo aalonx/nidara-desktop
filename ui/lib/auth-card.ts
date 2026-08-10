@@ -2,6 +2,7 @@ import { Gtk } from "ags/gtk4"
 import GLib from "gi://GLib"
 import { makeAvatar } from "./avatar"
 import { withGlassCapsule } from "./glass-capsule"
+import { playEntrance } from "./entrance"
 
 // The identity-and-password column both login screens are built around: avatar,
 // name, password field, primary button, failure message. The greeter adds a
@@ -146,12 +147,37 @@ export function buildAuthCard(opts: AuthCardOpts): AuthCard {
         halign: Gtk.Align.CENTER,
     })
     // On glass: it sits in the middle of the card, where the scrim is weakest, and
-    // neutral text on a light wallpaper needs a body behind it. The WRAPPER is what
-    // gets shown and hidden.
+    // neutral text on a light wallpaper needs a body behind it.
     const errorWrap = withGlassCapsule(errorLabel)
-    errorWrap.visible = false
     errorWrap.halign = Gtk.Align.CENTER
-    errorWrap.margin_top = 6
+
+    // 🔑 THE MESSAGE LIVES IN A RESERVED SLOT, and it is hidden with OPACITY rather
+    // than `visible`, because `visible = false` gives a widget no allocation.
+    //
+    // The card is `valign: CENTER`, so anything that changes its height moves its
+    // whole contents. Measured 2026-08-10: showing the message added 30px (24 of
+    // capsule + 6 of margin) and lifted the avatar, the name, the field and the
+    // button by exactly 15px each — half of it, because centring splits the growth
+    // in two. Failing a password made the thing you were typing into jump.
+    //
+    // 🔑 What reserves the space is the OPACITY, not any height: an empty
+    // Gtk.Label still measures one line, so this capsule is 24px tall whether it
+    // holds a message or nothing. A `min-height` on the slot looked like the
+    // mechanism and was not — removed after a mutation test showed setting it to 0
+    // changed nothing. One line is the true worst case: all 36 real messages
+    // (12 locales × wrongPassword/noSession/loginError) measure 24px, none wraps,
+    // widest 216px against the card's 280.
+    //
+    // The cost, stated plainly: the strip is always reserved, so with no error on
+    // screen the card sits 15px higher than it used to. That is the same 15px —
+    // paid once, statically, instead of every time authentication fails.
+    const errorSlot = new Gtk.Box({
+        css_classes: ["greeter-error-slot"],
+        halign: Gtk.Align.CENTER,
+        margin_top: 6,
+    })
+    errorSlot.append(errorWrap)
+    errorWrap.opacity = 0
 
     // ── Failure feedback ──────────────────────────────────────────────────────
     let errorTimer = 0
@@ -160,7 +186,7 @@ export function buildAuthCard(opts: AuthCardOpts): AuthCard {
     }
     const clearError = () => {
         stopTimer()
-        errorWrap.visible = false
+        errorWrap.opacity = 0
     }
     const showError = (msg: string) => {
         // ⚠️ Cancel the PREVIOUS timer first. Without this, a second failure inside
@@ -168,14 +194,14 @@ export function buildAuthCard(opts: AuthCardOpts): AuthCard {
         // early — the classic way this pattern breaks.
         stopTimer()
         errorLabel.label = msg
-        errorWrap.visible = true
+        errorWrap.opacity = 1
         passwordEntry.add_css_class("greeter-shake")
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
             passwordEntry.remove_css_class("greeter-shake")
             return GLib.SOURCE_REMOVE
         })
         errorTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ERROR_TTL_MS, () => {
-            errorWrap.visible = false
+            errorWrap.opacity = 0
             errorTimer = 0
             return GLib.SOURCE_REMOVE
         })
@@ -197,7 +223,7 @@ export function buildAuthCard(opts: AuthCardOpts): AuthCard {
     }
     passwordEntry.connect("notify::text", () => {
         if (clearingProgrammatically) return
-        if (errorWrap.visible) clearError()
+        if (errorWrap.opacity > 0) clearError()
     })
 
     passwordEntry.connect("activate", opts.onSubmit)
@@ -219,14 +245,15 @@ export function buildAuthCard(opts: AuthCardOpts): AuthCard {
     // marking the primary button.
     col.append(withGlassCapsule(passwordEntry, "subtle", true))
     col.append(withGlassCapsule(primaryButton, "strong", false))
-    col.append(errorWrap)
+    col.append(errorSlot)
+
+    // Entrance: driven by the frame clock, not a CSS transition — see
+    // ui/lib/entrance.ts for the measurement that forced that. 40 rather than 21
+    // because this column is `valign: CENTER` and centring hands half the margin
+    // back; both blocks end up travelling the same ~21px.
+    playEntrance(col, { rise: 40 })
 
     col.connect("map", () => {
-        // Trigger the entrance fade on the next frame so the transition runs.
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
-            col.add_css_class("greeter-card-shown")
-            return GLib.SOURCE_REMOVE
-        })
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
             passwordEntry.grab_focus()
             return GLib.SOURCE_REMOVE

@@ -1,6 +1,7 @@
 import { Gtk } from "ags/gtk4"
 import GLib from "gi://GLib"
 import { formatDatePart, type DateFormat } from "./date-names"
+import { playEntrance } from "./entrance"
 
 // The date + time block of the greeter and the lockscreen — the hero of both
 // screens. Returns the two labels in a column with no container chrome, for
@@ -73,8 +74,21 @@ export function NidaraClock(deps: ClockDeps): Gtk.Widget {
     const box = new Gtk.Box({
         orientation: Gtk.Orientation.VERTICAL,
         spacing: 0,
+        // The hero block arrives WITH the card rather than being there before it —
+        // both screens are one composition, and animating the card over a clock
+        // that was already sitting there read as one element on a static backdrop.
+        // Same class pair and same transition as `.greeter-card`; the numbers
+        // differ because this block is `valign: START` and the card is CENTER, so
+        // centring gives the card half its margin back and this gets all of it.
+        css_classes: ["greeter-hero"],
     })
     box.append(dateLabel)
     box.append(timeLabel)
+
+    // Same entrance as the card, same duration and curve, each on its own `map` —
+    // which is what keeps them in step without either knowing about the other. 21
+    // and not 40: this block is `valign: START`, so it keeps all of its margin as
+    // travel (and it is ADDITIVE with the `margin_top = 72` its host sets).
+    playEntrance(box, { rise: 21 })
     return box
 }

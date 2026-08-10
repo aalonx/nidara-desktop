@@ -411,17 +411,52 @@ window > contents {
   }
 }
 
-// ── Card entrance (fade-in on map) ───────────────────────────────────────────
-.greeter-card {
-  opacity: 0;
-  // 450ms is NOT on the $dur-* ladder and should not be snapped onto it: those
-  // three (100/180/260) time a control's state change, and this is a full-screen
-  // surface arriving. The CURVE is the system's, which is the part that was
-  // freehand — plain `ease` is not $ease.
-  transition: opacity 450ms $ease;
-}
-.greeter-card.greeter-card-shown {
-  opacity: 1;
+// ── Card + hero entrance ─────────────────────────────────────────────────────
+// NOT HERE ANY MORE, and that is the point. The entrance used to be
+// `.greeter-card { opacity: 0; margin-top: 40px; transition: … }` plus a
+// `-shown` class, and it worked in the greeter and in any ordinary window while
+// SNAPPING on the lockscreen — measured with frames flowing and the FROM state
+// laid out: the whole 21px in under 8ms, no interpolation at all.
+//
+// A CSS transition has a precondition that cannot be satisfied on a
+// session-lock surface: something painted to interpolate FROM. That surface gets
+// no frames for ~60ms after `map` and then delivers its first two ticks about 2ms
+// apart, so the initial state is laid out and never painted.
+//
+// So the animation is driven from the frame clock instead — `ui/lib/entrance.ts`,
+// which sets the initial state before the first map and owns the curve
+// ($ease-emphasized, solved). Both blocks travel ~21px over 450ms.
+//
+// ⚠️ Do not "restore" opacity/transition rules for `.greeter-card` or
+// `.greeter-hero` here. They would fight the JS that now owns both properties,
+// and on the one surface that matters they never worked.
+
+// ── The failure message's reserved slot ──────────────────────────────────────
+// The height is RESERVED so the message cannot move the card. Before this,
+// showing it grew the card by 30px and — because the card is centred — lifted the
+// avatar, the name, the password field and the button by 15px each, which meant
+// failing a password moved the field you were about to retype in.
+//
+// 🔑 THE RESERVATION IS THE `opacity`, NOT A HEIGHT — and this block carried a
+// `min-height: 30px` for about ten minutes that looked like the mechanism and was
+// not. Measured: **an empty Gtk.Label still measures one line**, so the capsule is
+// 24px tall whether it holds "Wrong password" or nothing at all. Toggling
+// `opacity` keeps it ALLOCATED, and the slot's height therefore never changes.
+// (`visible = false` is what breaks this: a hidden widget gets no allocation.)
+//
+// The `min-height` was removed because it only made the slot 6px TALLER than the
+// capsule it holds — the no-shift property was already there without it, and the
+// mutation test proved it: setting it to 0 changed nothing. Reserving by number
+// would also have been the fragile version, since the right number is the user's
+// UI font, not a constant.
+//
+// One line really is the worst case: all 36 real messages (12 locales ×
+// wrongPassword/noSession/loginError) measure 24px, none wraps, and the widest is
+// 216px against the card's 280.
+.greeter-error-slot {
+  // Fading suits what this is now: a message that expires on its own should leave
+  // the way it came rather than blink out.
+  > * { transition: opacity $dur-slow $ease; }
 }
 
 // ── Multi-user switcher ──────────────────────────────────────────────────────
