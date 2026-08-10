@@ -32,15 +32,24 @@ window.nidara-app-grid-window {
             border-color: rgba(var(--nidara-accent-rgb), 0.7);
             background: var(--nidara-surface);
         }
+
+        /* NO accent tint on the icon when the box is focused, and the rule that
+           tried is gone rather than fixed (2026-08-10). It had been dead since
+           #102 anyway — written as `.app-grid-search-box:focus-within &` from
+           inside `.app-grid-search-icon`, which was correct while that rule was
+           top-level but, once the file went inside the window scope, expanded `&`
+           to `#nidara-app-grid .app-grid-search-icon` and compiled to a window
+           nested inside a search box. Restoring it turned out to be the wrong fix:
+           `.nd-icon` glyphs are monochrome and get their colour from
+           `-gtk-icon-filter: invert(1)` (_reset.scss), so a `color` on them only
+           ever flips black↔white — an accent token cannot reach the pixels. The
+           focus signal is the box's own border and fill, above, which is enough.
+           (Parent-referencing `&` and a scope wrapper still do not mix: when a
+           rule needs an ancestor's state, nest it under that ancestor.) */
     }
 
     .app-grid-search-icon {
         color: var(--nidara-text-dim);
-
-        .app-grid-search-box:focus-within &,
-        .app-grid-search-box.search-active & {
-            color: var(--nidara-accent);
-        }
     }
 
     .app-grid-search-entry {

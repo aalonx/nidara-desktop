@@ -282,6 +282,29 @@ selection {
     min-height: 1px;
 }
 
+// ── Inline confirmation view ──────────────────────────────────────────────────
+// Confirm view buttons = nidara-menu-row (geometry + hover) + an emphasis tone.
+// UNIVERSAL (nidara-*), not the system menu's own: any flat list that needs a
+// destructive confirm swaps its row for a cancel/confirm pair in place rather than
+// opening a dialog — a modal over a popover dismisses the surface it is asking
+// about. Shared by the bar system menu (logout/restart/shutdown) and the clipboard
+// widget's "Clear history".
+// Lived in _bar.scss until 2026-08-10; a nidara-* class belongs to the kit, and
+// leaving it there is what made _bar.scss look like it had to stay unscoped.
+.nidara-confirm-secondary {
+    background: var(--nidara-surface-back);
+    color: var(--nidara-text-dim);
+    font-size: $fs-caption;
+    &:hover { color: var(--nidara-text); }
+}
+
+.nidara-confirm-primary {
+    background: var(--nidara-surface);
+    color: var(--nidara-text);
+    font-size: $fs-caption;
+    font-weight: $fw-semibold;
+}
+
 /* Glass menu popover — the Gtk.Popover surface that hosts a Cairo glass bubble
    (common/GlassBubble) + the .nidara-menu rows above. Shared by the dock context
    menu and the app-grid context menu so every glass menu speaks one language.
@@ -385,6 +408,65 @@ button.nidara-seg-btn {
     }
 }
 
+// ── Dim modifier ─────────────────────────────────────────────────────────────
+// Secondary text: a read-only value at the end of a row (`staticLabel` in
+// SettingsHelpers), the save-path in the screen-recorder's settings. It had NO
+// rule anywhere — the class named an intent nobody implemented, so those labels
+// rendered at full text colour, in both Settings and the CC (2026-08-10). A
+// modifier, deliberately unqualified by element and by window: it says one thing
+// and says it everywhere.
+//
+// It used to be paired with `.settings-row-status`, which carried no
+// declarations at all and has been dropped from its four call sites. A class
+// that promises styling and delivers none is how `.accent-label` ended up on
+// MenuRow's tick.
+.dimmed {
+    color: var(--nidara-text-dim);
+}
+
+// ── Slider readout ───────────────────────────────────────────────────────────
+// The number beside a slider ("72%", "4500K"). Nine consumers and not one of them
+// is only the Control Center: `control-center/Sliders.tsx`, the brightness /
+// night-light / volume widgets, and Settings → Audio / Appearance / the shared
+// `SettingsHelpers` row. Its rule was inside `#nidara-bar .cc-detail-panel`, so
+// everywhere else — the whole Settings window included — the readout rendered at
+// default size and colour, with the digits free to jitter as they counted
+// (2026-08-10, same sweep that found the "Default" badge below).
+.slider-value-label {
+    color: var(--nidara-text-dim);
+    font-size: $fs-small;
+    font-variant-numeric: tabular-nums;
+}
+
+// ── "Default" badge ──────────────────────────────────────────────────────────
+// The accent pill marking the current default audio device. TWO surfaces build
+// it from the same two classes: the CC's audio detail page (`widgets/volume.ts`)
+// and Settings → Audio (`pages/Audio.tsx`). It lived inside
+// `#nidara-bar .cc-detail-panel` in _control-center.scss, so the Settings copy
+// rendered as plain text — the same defect as the media panel, one surface's
+// sheet owning a component two surfaces wear (2026-08-10).
+//
+// Qualified `label` on purpose: this is a TEXT badge, and the unqualified class
+// is what let a Gtk.Image pick the whole pill up — MenuRow's tick wore
+// `accent-label` hoping to be tinted accent (impossible on an nd-icon) and got a
+// background instead. Keep the element qualifier.
+label.accent-label {
+    color: var(--nidara-text);
+    background: rgba(var(--nidara-accent-rgb), 0.14);
+    border-radius: $nidara-radius-pill;
+    padding: 2px 8px;
+    font-size: $fs-caption;
+    font-weight: $fw-semibold;
+}
+
+// ── Atomic-widget popover vocabulary ─────────────────────────────────────────
+// The key/value/readout row and its inline icon button, worn by the widgets in
+// widgets/ (wifi, ethernet, battery, night-light, focus, bluetooth, volume,
+// brightness). Global on purpose: a widget is placed by the USER — today the bar
+// and the Control Center grid, tomorrow wherever the plugin system lands one —
+// so its vocabulary cannot belong to a surface's sheet. `-value` and `-icon-btn`
+// joined their siblings here on 2026-08-10; they had been sitting unscoped in
+// _bar.scss, which is what made the family look like two different things.
 .bar-popover-key {
     font-size: $fs-small;
     color: var(--nidara-text-dim);
@@ -394,6 +476,25 @@ button.nidara-seg-btn {
     font-size: $fs-small;
     font-weight: $fw-medium;
     color: var(--nidara-text);
+}
+
+.bar-popover-value {
+    font-size: $fs-small;
+    font-weight: $fw-medium;
+    color: var(--nidara-text);
+    min-width: 40px;
+}
+
+.bar-popover-icon-btn {
+    background: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    padding: 4px;
+    border-radius: $nidara-radius-xs;
+    transition: background-color 0.15s ease, box-shadow 0.15s ease;
+
+    @include nidara-tile-states;
 }
 
 // =============================================================================

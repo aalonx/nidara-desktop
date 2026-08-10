@@ -165,6 +165,21 @@ magnifier glyph (off-brand, wrong on the opposite mode). Wire filtering off the 
 `changed`. The Settings sidebar search (`Settings.tsx`) is the reference; App Icons repeated the
 `SearchEntry` mistake and was corrected (2026-07-04).
 
+⚠️ **If a surface types INTO that `Gtk.Text` from its own key handler, move the caret yourself.** The
+app grid takes keys at the window level (the focus grab routes them there so the same keystroke can
+also drive grid navigation) and pushes characters into the **buffer**:
+`buf.insert_text(buf.get_length(), ch, 1)`. A `GtkEntryBuffer` has no cursor, and `Gtk.Text` only
+advances its position from its own editing path — so the letters land correctly and the caret sits at
+column 0 forever. Nothing warns. Follow every buffer mutation with `entry.set_position(-1)`
+(GtkEditable: "after the last character"), ideally by routing all of them through one helper, as
+`AppGrid.tsx`'s `searchInsert`/`searchBackspace` now do. Shipped broken; user-caught 2026-08-10.
+
+⚠️ **Do not tint the magnifier on focus.** It is an `nd-icon`, so `color` cannot reach it — the glyph
+is monochrome and driven by `-gtk-icon-filter: invert(1)`, a black/white toggle, not a recolor (see
+"Most icon glyphs cannot be CSS-recolored" below). The focus signal belongs on the BOX: border and
+fill. An accent rule on the app grid's search icon was written, was dead for other reasons, and was
+deleted rather than repaired once that was understood (2026-08-10).
+
 ## Ghost descenders on filter (PROVISIONAL fix — see tech-debt)
 
 **Symptom:** in App Icons (`pages/AppIcons.tsx`) — the only Settings list with a live **search that
@@ -1882,11 +1897,55 @@ These are the patterns that bite. Most "the styles look wrong" bugs in this code
    | Dock | `#nidara-dock, .nidara-dock-window` |
    | App grid | `#nidara-app-grid, .nidara-app-grid-window` |
    | Settings | `window.nidara-settings-window` |
+   | About | `window#nidara-about, .about-floating-window` |
+
+   ⚠️ **The window a class lands in is NOT the directory its TSX lives in.** `_bar.scss` was the last
+   unscoped surface sheet (closed 2026-08-10) and the mapping was not what the filenames said:
+   `Bar.tsx` builds the capsule row and hands it to `islandWin.mount()`, so `.bar-center` — declared
+   in `surfaces/bar/` — renders inside `#nidara-island` and nowhere else, while `.bar-centerbox` is
+   built twice and genuinely needs both scopes. `.workspace-dot` never appears in the bar at all
+   (`makeWorkspaceDot` is called only from the island and from the overview, which is mounted inside
+   the island). Scoping either one to `#nidara-bar` on the strength of its filename would have
+   silently unstyled the capsule and every workspace dot. **Follow the mount site, not the folder:**
+   grep the class, then grep where the widget holding it is `append`ed / `mount`ed.
+
+   ⚠️ **Parent-referencing `&` and a scope wrapper do not mix.** `.app-grid-search-box:focus-within &`
+   written inside `.app-grid-search-icon` was correct while that rule was top-level; once `#102`
+   wrapped the file in the window scope, `&` expanded to `#nidara-app-grid .app-grid-search-icon` and
+   the rule compiled to `.app-grid-search-box:focus-within #nidara-app-grid .app-grid-search-icon` — a
+   window nested inside a search box, unmatchable. The search icon stopped turning accent and nothing
+   reported it (found and fixed 2026-08-10). **When a rule needs an ancestor's state, nest it under
+   that ancestor** (`&:focus-within .app-grid-search-icon`), never reach back up with `&`. After
+   adding a scope wrapper, grep the compiled `style.css` for `#nidara-` appearing anywhere other than
+   the START of a selector — every hit is a rule that can never match.
+
+   ⚠️ **An atomic widget has no surface, so its CSS belongs to the kit.** Anything under `widgets/`
+   is placed by the USER (bar, CC grid, wherever the plugin system lands it next), so its classes go
+   in `_components.scss`, not in the sheet of whichever surface happens to host it today. That is why
+   `.bar-popover-key/-val/-value/-icon-btn` all live there despite the `bar-` prefix in the name.
 
    ⚠️ **A shared widget spans scopes and must list them all.** `common/WorkspaceSchematic.ts` renders
    into the island (overview) *and* the app grid (workspace strip), so `_workspace.scss` carries two
    blocks. Put a `.wo-schematic-*` rule in the island-only block and it silently stops painting in
    the app grid — nothing errors, the strip just goes flat.
+
+   The one that actually shipped broken: `widgets/media.ts` builds ONE panel
+   (`buildMediaDetailPanel`) and three surfaces show it — the bar pill expansion and the CC detail
+   page, both inside the bar's window, **and the island's PLAYER mode** (`PlayerIsland.tsx`). Its
+   `.cc-media-*` rules were inside `_control-center.scss`'s `#nidara-bar` block, so from the day the
+   island got its own window (2026-07-26) the transport buttons and the source selector rendered with
+   raw GTK defaults there. Nobody noticed until 2026-08-10. They now carry both scopes — and
+   deliberately stay **window-scoped rather than global**, so that whatever outranks them in the bar
+   outranks them identically in the island; dropping to a bare `.cc-media-*` would have changed that
+   balance in one window only (`.cc-island button` and `.bar-center button` are both (1,1,1)).
+
+   **The detector is committed: `scripts/dev/scope-audit.mjs`** (`node ../../scripts/dev/scope-audit.mjs`
+   from `ui/shell`, after a build). It collects every class used by code that renders into each
+   window and checks the compiled `style.css` for at least one selector that is either unscoped or
+   scoped to that window. Classes with no CSS at all are Cairo-painted and fine; classes whose only
+   selectors name a *different* window are the bug. **Re-run it whenever a surface moves windows** —
+   it found the media panel, the "Default" badge and the slider readout in one pass. Details and its
+   limits in `dev-workflow.md`.
 
    ⚠️ **A window's scope can MOVE, and nothing tells you.** The app grid's was `#nidara-dock` until
    2026-08-09, because the panel lived inside the dock's window; giving it a surface of its own
