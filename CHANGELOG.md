@@ -5,6 +5,72 @@ All notable changes to Nidara are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-08-11
+
+### Fixed
+
+- **The login card was invisible.** Since 0.6.0, the greeter drew its background
+  and nothing else: no card, no username, no password field. You could still log
+  in by typing blind and pressing Enter, which is the only reason it was not
+  reported sooner. A single failing line in a signal handler was aborting the
+  rest of the card's construction silently — nothing crashed, nothing logged.
+  CI now boots the greeter and the lockscreen and fails if either comes up empty.
+
+- **Every install that built its package locally left you locked out of your own
+  package cache.** The build ran as root and left root-owned files behind, so the
+  next `pacman` invocation refused to write there. Anyone whose install fell back
+  to a local build — the normal path whenever the prebuilt package is behind —
+  hit it.
+
+- **Text was being shaved at the top.** Capital letters and accents lost their
+  first pixel row across the whole shell, because the baseline never landed on a
+  pixel boundary. Fixing it properly also fixed the accessibility text slider,
+  which was snapping to whole pixels and therefore skipping sizes: font sizes are
+  in points now, and the crispness comes from the metric hint it was missing.
+
+- **Picking a font whose name contains a style quietly switched your desktop to
+  something else.** Choosing "Inter Medium" set the interface to a different
+  family entirely; this machine had been running the wrong font for months
+  without anyone noticing.
+
+- **Russian shipped with a truncated menu entry.** "Специальные возможности" did
+  not fit the sidebar at the default text size, in a released version. It is
+  abbreviated now, and a new CI gate measures every sidebar entry in all twelve
+  languages at every text scale, so the next one cannot ship unnoticed.
+
+- **The lock screen's "wrong password" message misbehaved three ways.** It moved
+  the field you were about to retype in, it stayed on screen after every reason
+  to still be there had passed, and the entrance animation never ran at all on
+  the lock. All three are fixed, and the clock now appears with the first frame
+  instead of jumping into place.
+
+- **Settings pages were each quietly a different window.** Page width was derived
+  from content, so switching pages resized the window under your pointer. The
+  content pane is a constant width now. The breadcrumb also showed only one
+  ancestor, so a three-level page lost the one that says where you are.
+
+- **The Sound page had two empty sections**, and the alert dialog Settings opens
+  spent three days with no styling at all.
+
+### Changed
+
+- **The desktop got substantially cheaper to draw.** The bar, the Activity
+  Island, the dock and the app grid were each asking the compositor to blur an
+  entire monitor in order to show a strip, a capsule or a panel — and the app
+  grid was taking the dock's blur down with it every time it opened. Each surface
+  now declares only the region it occupies. Opening the Control Center costs
+  nothing measurable where it used to cost real frames, and the Workspace
+  Overview shows live window content rather than placeholders.
+
+- **Clicking outside a panel to dismiss it is the compositor's job now.** The
+  invisible full-screen catchers the shell used for this are gone, replaced by
+  the Wayland protocol built for it.
+
+- **The greeter and the lockscreen rejoined the design system.** They had drifted
+  into their own look and their own copies of widgets Nidara already had — one of
+  those copies had stopped describing the screen accurately. They share the real
+  components now.
+
 ## [0.6.0] — 2026-08-04
 
 ### Added
