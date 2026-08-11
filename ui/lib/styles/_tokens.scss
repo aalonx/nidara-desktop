@@ -53,6 +53,13 @@ $fs-title-1:  28px;  // large titles (rare in shell UI)
 // The rule that has not changed: SHELL CHROME uses the fixed `$fs-*` px ramp.
 // A bar or dock label that reflows with the font picker breaks the layout it
 // sits in; a row of text in a window is supposed to grow. Ratios vs a 14px base.
+//
+// ⚠️ Do NOT retune these to land on whole pixels. It was tried twice (#123, #124,
+// both reverted): the anchor is `gtk-font-name`, which is a POINT size precisely so
+// the accessibility text scale can reach it through the dpi, and 11pt is 14.667px —
+// no set of ratios lands a fractional anchor on integers. It does not matter either.
+// Crisp text comes from `gtk-hint-font-metrics` rounding the ASCENT (see
+// ui/lib/font-rendering.ts), which works the same at a fractional size.
 $fse-mini:     0.79em;
 $fse-caption:  0.86em;
 $fse-small:    0.93em;

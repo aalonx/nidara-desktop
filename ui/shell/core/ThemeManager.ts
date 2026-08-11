@@ -6,6 +6,7 @@ import { Gdk, Gtk } from "ags/gtk4"
 import app from "ags/gtk4/app"
 import { execAsync } from "ags/process"
 import { readFile, writeFile } from "ags/file"
+import { applyCrispFontRendering } from "../../lib/font-rendering"
 import {
     type NidaraThemeConfig,
     type AccentKey,
@@ -43,6 +44,16 @@ async function probeAdwStyleManager(): Promise<any | null> {
     }
     return adwStyleManager
 }
+
+/**
+ * The range the Accessibility text slider offers, and the range the reflowing
+ * windows are known to survive. ⚠️ MEASURED, not chosen — see the comment on the
+ * slider in `pages/Accessibility.tsx` and tech-debt #62. It lives here because
+ * `applyAll` has to clamp a value stored by an older build (the slider used to go
+ * to 2.0) — a factor above the maximum is a state the UI cannot represent.
+ */
+export const TEXT_SCALE_MIN = 0.75
+export const TEXT_SCALE_MAX = 1.5
 
 export async function setPreferDark(dark: boolean) {
     const sm = await probeAdwStyleManager()
@@ -83,7 +94,7 @@ class ThemeManager extends GObject.Object {
         themeFamily: "",   // populated by syncFromSystem() on first run
         iconTheme: "",     // populated by syncFromSystem() on first run
         cursorTheme: "",   // populated by syncFromSystem() on first run
-        isDark: true
+        isDark: true,
     }
 
     private fcConfig: NidaraThemeConfig = { ...DEFAULT_CONFIG }
@@ -155,10 +166,9 @@ class ThemeManager extends GObject.Object {
      * either way and inherited whatever the default was.
      */
     private syncFontMetrics() {
-        try {
-            const s = Gtk.Settings.get_default()
-            if (s) s.gtk_hint_font_metrics = true
-        } catch (e) { }
+        // One lever, shared by all three bundles — see ui/lib/font-rendering.ts for
+        // why `gtk-hint-font-metrics` alone did nothing for months.
+        applyCrispFontRendering()
     }
 
     private syncFont() {
@@ -306,6 +316,9 @@ class ThemeManager extends GObject.Object {
         return this.state.isDark
     }
     get accentPalette() { return ACCENT_PALETTE }
+    /** The interface font as stored: family + POINT size, unscaled. The
+     *  accessibility text scale is applied downstream by GTK, via the dpi — it is
+     *  deliberately not folded in here (see `fontToPoints`). */
     get interfaceFont(): string {
         try { return this.interfaceSettings.get_string("font-name") } catch (_) { return "Sans 11" }
     }
@@ -368,43 +381,84 @@ class ThemeManager extends GObject.Object {
     }
 
     /**
-     * Rewrite a font string so its size is a WHOLE NUMBER OF PIXELS.
+     * Rewrite a font string so its size is in POINTS, whatever unit it arrived in.
      *
-     * The font dialog hands back POINT sizes, and a point size is a lottery: at
-     * 96dpi 11pt is 14.667px and 10pt is 13.333px, while 10.5pt is exactly 14. A
-     * fractional pixels-per-em is the second half of the crisp-text story
-     * (`syncFontMetrics` is the first), and it also propagates: the `$fse-*` ramp is
-     * relative, so every step inherits the anchor's fraction. Pango's `<n>px` form
-     * is absolute, which additionally stops the same setting meaning two different
-     * sizes on two machines whose dpi differ.
+     * 🔑 The unit is load-bearing for accessibility, and this is the whole reason
+     * the function exists. `text-scaling-factor` is applied by GTK by multiplying
+     * `gtk-xft-dpi` (gdkdisplay-wayland folds it in), and an absolute PIXEL size is
+     * immune to dpi by definition. So when #123 started storing "Inter 14px" the
+     * Accessibility text slider went dead — and the workaround for that (Nidara
+     * rescaling both fonts itself from an unscaled base) made the slider WORSE than
+     * dead: the effective size was `round(basePx × factor)`, so with a 15px base the
+     * whole 0.75–2.0 range held 20 distinct sizes and ~5 of every 6 thumb positions
+     * changed nothing. A pixel is the smallest step there is; a factor needs a
+     * smaller one. In points the factor lands in the dpi, where it belongs, and the
+     * slider is continuous again with no code of ours in the path.
      *
-     * Snapped on the way IN — one door, the one every pick comes through — rather
-     * than rounded at each read.
+     * ⚠️ The px form was introduced to put the type ramp on whole pixels FOR CRISP
+     * TEXT. That was the wrong lever, measured: at a fractional 14.667px,
+     * `gtk-hint-font-metrics` already rounds the ascent to 15.0 and the T's crossbar
+     * lands on one row (see `syncFontMetrics` and ui/lib/font-rendering.ts).
+     * Crispness comes from the hint, not from the size — so points cost nothing.
+     *
+     * Whole points, because that is the granularity every font picker offers; the
+     * historical default "Inter 11" is what 15px rounds back to.
      */
-    private snapFontToWholePixels(fontName: string): string {
+    private fontToPoints(fontName: string): string {
         try {
             const desc = Pango.FontDescription.from_string(fontName)
-            const dpi = (Gtk.Settings.get_default()?.gtk_xft_dpi ?? 96 * 1024) / 1024
-            const px = desc.get_size_is_absolute()
-                ? desc.get_size() / Pango.SCALE
-                : (desc.get_size() / Pango.SCALE) * dpi / 72
-            if (!(px > 0)) return fontName
-            desc.set_absolute_size(Math.round(px) * Pango.SCALE)
+            if (!desc.get_size_is_absolute()) return fontName
+            const px = desc.get_size() / Pango.SCALE
+            const pt = Math.round(px * 72 / this.unscaledDpi())
+            if (!(pt > 0)) return fontName
+            desc.set_size(pt * Pango.SCALE)
             return desc.to_string()
         } catch (e) {
             return fontName
         }
     }
 
+    /**
+     * `gtk-xft-dpi` with the accessibility text scale taken back out.
+     *
+     * ⚠️ GTK folds `text-scaling-factor` INTO the dpi, so converting px→pt against
+     * the raw value while the slider is up would bake the scale into the stored
+     * size — and then GTK would scale it a second time.
+     */
+    private unscaledDpi(): number {
+        const scaledDpi = (Gtk.Settings.get_default()?.gtk_xft_dpi ?? 96 * 1024) / 1024
+        return scaledDpi / (this.textScaling || 1)
+    }
+
+    /**
+     * Migrate a font stored in absolute pixels back to points.
+     *
+     * Needed because #123/#124 wrote "<family> 15px" into gsettings on machines that
+     * already ran them, and `applyAll`'s seed only fires when the key has no user
+     * value — so without this an upgrading user keeps the pixel size and keeps the
+     * dead text slider. Idempotent: a point-sized font is returned untouched, so
+     * this can run on every boot. It also picks up a px font set by another tool
+     * (nwg-look, GNOME Tweaks, a dotfile).
+     */
+    private migrateFontsToPoints() {
+        for (const key of ["font-name", "monospace-font-name"]) {
+            const live = this.interfaceSettings.get_string(key)
+            const pts = this.fontToPoints(live)
+            if (pts !== live) {
+                console.log(`[ThemeManager] ${key}: "${live}" → "${pts}" (px → pt, so text scaling works)`)
+                this.interfaceSettings.set_string(key, pts)
+            }
+        }
+    }
+
     async setFont(fontName: string) {
-        fontName = this.snapFontToWholePixels(fontName)
-        await execAsync(["gsettings", "set", "org.gnome.desktop.interface", "font-name", fontName])
+        this.interfaceSettings.set_string("font-name", this.fontToPoints(fontName))
         if (this.state.themeFamily) this.updateSettingsIni(this.state.themeFamily)
         this.emit("changed")
     }
 
     async setMonoFont(fontName: string) {
-        await execAsync(["gsettings", "set", "org.gnome.desktop.interface", "monospace-font-name", fontName])
+        this.interfaceSettings.set_string("monospace-font-name", this.fontToPoints(fontName))
         this.emit("changed")
     }
 
@@ -414,7 +468,16 @@ class ThemeManager extends GObject.Object {
 
     async setTextScaling(factor: number) {
         const rounded = Math.round(factor * 100) / 100
-        await execAsync(["gsettings", "set", "org.gnome.desktop.interface", "text-scaling-factor", String(rounded)])
+        // ⚠️ In-process `set_double`, NOT `execAsync(["gsettings", …])`. This runs on
+        // every step of a drag, and spawning a subprocess per step is what forced the
+        // slider to commit only on release — so the size jumped into place after the
+        // fact instead of following the thumb.
+        //
+        // Nothing else to do: the fonts are stored in POINTS (fontToPoints), so GTK
+        // applies the factor itself through `gtk-xft-dpi`, continuously. settings.ini
+        // needs no rewrite either — it carries the unscaled point size, and a GTK3
+        // app reads the factor from the same portal we just wrote to.
+        this.interfaceSettings.set_double("text-scaling-factor", rounded)
         this.emit("changed")
     }
 
@@ -612,18 +675,33 @@ class ThemeManager extends GObject.Object {
         // from an explicit choice), so a deliberate pick is never clobbered on later boots.
         // Runs before syncGtkTheme so the settings.ini it writes also gets Inter.
         if (this.interfaceSettings.get_user_value("font-name") === null)
-            // ⚠️ "14px", not "11". A point size resolves to a fractional pixel size
-            // at 96dpi (11pt = 14.667px) and the relative ramp hangs off this
-            // anchor, so every step inherited the fraction. 14px is also the base
-            // the $fse-* ratios were designed against: at 14 they land within
-            // 0.05px of whole pixels (11.06 / 12.04 / 13.02 / 14 / 14.98), where
-            // 14.667 gave 11.59 / 12.61 / 13.64 / 14.67 / 15.69.
-            this.interfaceSettings.set_string("font-name", "Inter 14px")
+            // ⚠️ "Inter 11" — POINTS, and the same 11 every install has shipped since
+            // PR #6. #123 replaced it with "14px" to put the type ramp on whole pixels
+            // (which quietly shrank the default by 4.5%, since 11pt is 14.667px), and
+            // #124 then moved it to "15px". Both were chasing crisp text through the
+            // font SIZE; the lever turned out to be `gtk-hint-font-metrics`, which
+            // rounds the ascent at a fractional size just as well. An absolute size
+            // also kills the accessibility text scale outright — see `fontToPoints`.
+            this.interfaceSettings.set_string("font-name", "Inter 11")
         // Same deal for the monospace font: the schema default ("Adwaita Mono 11")
         // names a font we don't even install, while ttf-jetbrains-mono-nerd ships
         // with every Nidara install. Seed it once; never clobber a user's pick.
         if (this.interfaceSettings.get_user_value("monospace-font-name") === null)
             this.interfaceSettings.set_string("monospace-font-name", "JetBrainsMono Nerd Font 11")
+
+        // Undo #123/#124 on machines that already ran them: a font stored in absolute
+        // pixels makes the accessibility text slider a no-op. Idempotent.
+        this.migrateFontsToPoints()
+
+        // Bring a factor stored by an older build (whose slider went to 2.0) back into
+        // the range the layout actually survives. Only downwards, and logged: this
+        // REDUCES someone's text size, so it must be findable in the log rather than
+        // just mysterious.
+        const scale = this.textScaling
+        if (scale > TEXT_SCALE_MAX) {
+            console.log(`[ThemeManager] text-scaling-factor ${scale} → ${TEXT_SCALE_MAX} (above the range the reflowing windows support)`)
+            this.interfaceSettings.set_double("text-scaling-factor", TEXT_SCALE_MAX)
+        }
 
         await this.syncGtkTheme()
         const settings = this.interfaceSettings
