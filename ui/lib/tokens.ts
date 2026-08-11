@@ -116,3 +116,117 @@ export const rowInsetFor = (surfaceRadius: number, n: number = 3.2, rowRadius: n
     Math.max(4, Math.round((cornerReach(n) * surfaceRadius - cornerReach(2) * rowRadius) / cornerReach(2)))
 
 
+/**
+ * WINDOW_LAYOUT — the geometry law of a `NidaraWindow` (sidebar + content).
+ *
+ * ## The law
+ *
+ * **The content pane is a CONSTANT width.** Not a maximum, not a band: 800px, on
+ * every page, in every locale, at every text scale. Making the window wider adds
+ * empty margin around it and nothing else. Narrowing it first spends that margin,
+ * then makes the sidebar float (`collapseAt`), and then hits the window's minimum.
+ *
+ * Stated as a function of the width W available INSIDE the glass rim (which is
+ * what the split view measures — a window is `W + 2·glassRim` wide), with
+ * S = `sidebar`, C = `content`:
+ *
+ *     W ≥ S + C   →  sidebar DOCKED,   content C, centred in W − S
+ *     C ≤ W < S+C →  sidebar FLOATING, content C, centred in W
+ *     F ≤ W < C   →  sidebar FLOATING, content W — the pane YIELDS rather than
+ *                    let the window's edge cut a row's trailing control off
+ *                    (`contentFloor`, below)
+ *     W < F       →  refused (`set_size_request`); a compositor that forces it
+ *                    anyway gets horizontal SCROLL, not a clip
+ *
+ * It is continuous: at W = S + C both branches give the same content width, so
+ * the sidebar leaving does not resize the page under the pointer. That exactness
+ * is why the comparison is in rim-space and not window-space: at W = S + C the
+ * docked pane gets exactly C, and shaving 2px off the breakpoint to make the
+ * number rounder would hand it C − 2 and start the page scrolling sideways.
+ *
+ * ## Why constant, and why 800
+ *
+ * The predecessor had a maximum (800) and no minimum, and derived the collapse
+ * breakpoint from the ACTIVE PAGE's natural width — recomputed every 200 ms. Both
+ * halves of that were wrong, measured live 2026-08-11 (`ags request queryUI`,
+ * 18 pages × window widths):
+ *
+ *   - The breakpoint differed PER PAGE. At a 850px window, 16 pages kept the
+ *     sidebar docked while Appearance and Region (the two with a 320px preview)
+ *     collapsed it — so merely navigating Display → Appearance made the sidebar
+ *     vanish and the page jump 518 → 720px wide.
+ *   - Content width was not monotonic in window width: 900 → 568, 800 → 468,
+ *     700 → **618**, 600 → 518. Narrowing the window made the page WIDER at the
+ *     breakpoint, because collapsing hands the sidebar's 250px to the content.
+ *   - With no minimum, the window shrank to 250px while the page stayed at 403px
+ *     and was CLIPPED — no scroll, no floor. On the way there a subtitle got 47px
+ *     of column, i.e. one word per line.
+ *
+ * 800 is not a round number picked for looks: it is what the widest ROW needs.
+ * Measured across all 18 pages, the widest trailing control is 388px (Appearance →
+ * Accent color), then 324 (Region) and 315 (a slider row). At C = 800 the page
+ * inside its `$space-10` padding is 720 and a row's content box is 688, which
+ * leaves the widest row ~347px of text column — about 40 characters, enough for
+ * every title in the shipped locales on one line. Below ~720 that budget starts
+ * breaking titles: measured, Appearance breaks at 518 and most pages by 418.
+ *
+ * That is also the argument against an elastic band: between 640 and 800 there is
+ * nothing to gain and a text column to lose. A constant instead buys the thing a
+ * settings window actually needs — ONE width for the row contract to be correct
+ * at, forever, instead of a range where "correct" has to hold at every point.
+ * (Prior art for the shape: macOS System Settings has a hard minimum window and
+ * never reflows its content pane.)
+ *
+ * ## `contentFloor` — the distress width, and why the law needs a second number
+ *
+ * The first version of this made `content` the window's minimum too, so the pane
+ * could never be squeezed at all. On a TILING compositor that is not a promise
+ * anyone keeps: `set_size_request` reaches Hyprland as `xdg_toplevel.set_min_size`
+ * and Hyprland tiles at whatever the layout says regardless. Measured 2026-08-11
+ * with Settings in a 673px tile and the floor at 802: GTK laid the window out at
+ * its own 802px minimum, the compositor cut the last 129px off, and a row's
+ * trailing button went with it. Unreachable controls are worse than tight text.
+ *
+ * ⚠️ And it cannot be made conditional on being tiled — that was the second try.
+ * **Hyprland never clears the `tiled` toplevel state**: measured on a window it had
+ * just floated and resized, GTK still carried `tiled-top/left/right/bottom` AND
+ * `maximized`. As a signal for "someone else is sizing me" it is stuck on.
+ *
+ * So the floor is uniform and it is `contentFloor`: the pane is `content` in every
+ * window with room for it — which is every ordinary one, including the size it
+ * opens at and every width where the sidebar docks — and yields below that.
+ *
+ * This is NOT the elastic band that was rejected. That question was which width
+ * pages are DESIGNED at, and the answer is one constant. This is what happens in a
+ * window too small for the design, where the only choice is which way to fail. 560
+ * covers the tiles that actually happen (four columns on a 2560 screen is 640,
+ * three is 853); under it the page scrolls horizontally instead.
+ */
+export const WINDOW_LAYOUT = {
+    /** Docked sidebar column, including its 8px capsule margin. */
+    sidebar: 250,
+    /** The content pane. A CONSTANT — see above. */
+    content: 800,
+    /** The distress width — only a compositor can push the pane here. */
+    contentFloor: 560,
+    /**
+     * The 1px glass rim on each side of the window (`.nidara-window-glass`), which
+     * the minimum size has to include or the pane loses 2px at the floor.
+     */
+    glassRim: 1,
+    /** Window minimum height. Two cards and a header have to fit, or the scroll
+     *  view is taller than its own first row. */
+    minHeight: 480,
+} as const
+
+/** Window width at or above which the sidebar is DOCKED rather than floating. */
+export const collapseAtFor = (
+    sidebar: number = WINDOW_LAYOUT.sidebar,
+    content: number = WINDOW_LAYOUT.content,
+): number => sidebar + content
+
+/** Smallest window width the content pane can be shown at without scrolling. */
+export const minWindowWidthFor = (content: number = WINDOW_LAYOUT.content): number =>
+    content + WINDOW_LAYOUT.glassRim * 2
+
+
