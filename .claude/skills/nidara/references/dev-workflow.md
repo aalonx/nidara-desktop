@@ -497,6 +497,41 @@ focused state is a live check.
 enough that a single number fits two readings; compare DELTAS between nodes measured in the
 same run — that rule is why the probe prints the pairs itself.
 
+### Verifying the CURSOR — a capture will lie to you, and confidently
+
+`grim -c` (screencopy with the cursor composited in) does **not** show the cursor that is on the
+screen: it refreshes its copy of it on the pointer-focus path, so it reports the cursor as of the
+last `wl_pointer.enter`. Anything that changes the cursor *without* an enter — which is exactly what
+`common/CursorRefresh.ts` exists to do — is invisible to it, and the capture reads as "nothing
+happened".
+
+Measured 2026-08-16, cursor size set to 96 with the pointer verifiably still for a minute: the
+capture reported the same 13×21 px box as at size 24, while the user looking at that screen at that
+instant saw a cursor four times bigger. **The user was right.** Three separate capture-based A/Bs
+had already "proved" the fix dead before a person looked.
+
+So, to verify cursor behaviour, one of these two — never a screenshot:
+
+- **A person.** Park the pointer, do not touch it, change the setting, ask. Cheap and decisive.
+- **The wire.** `WAYLAND_DEBUG=1 gjs -m probe.js 2> log`, with a small GTK4 window as the client, then
+  grep the log for `wp_cursor_shape_device_v1.set_shape` (GTK4 ≥ 4.16 drives the cursor through
+  `cursor-shape-v1`, so the picture is the COMPOSITOR's, not a buffer the client uploads). Assert the
+  ORDER: a `set_shape` that sits right after a `wl_pointer.enter` line is that enter, not your change.
+  That ordering check is what caught a false green here — the pointer injection used to park the
+  pointer (`nidara-click hover-at`) plays the AI-cursor choreography first, so its `enter` lands
+  **seconds** after the command returns.
+
+⚠️ Check WHAT IS UNDER THE POINTER before believing a negative. `common/CursorRefresh.ts` can only
+bump the shell's own surfaces, and **restarting the shell destroys the Settings window** (created
+lazily, hides on close) — so a test that restarts and then changes a setting leaves the pointer over
+the wallpaper, with nothing of ours beneath it, and produces a completely convincing "it does not
+work". That is exactly what made the cursor THEME look broken for a round after the SIZE was already
+confirmed working. `ags request listWindows` + `hyprctl cursorpos` settles it in one line.
+
+⚠️ And the other half of the trap: **the visible cursor and the setting can disagree indefinitely.**
+After a size change with no enter, `gsettings get cursor-size` says 24 while the screen shows the old
+96. A test that reads the setting to decide what is on screen is measuring nothing.
+
 ### Measuring what a layer's blur costs (`scripts/dev/blur-arm.sh`)
 
 The harness behind `references/tech-debt.md` §46. Use it for any claim of the form "this surface's

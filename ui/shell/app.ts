@@ -66,6 +66,7 @@ import Settings from "./surfaces/settings/Settings"
 import Theme, { setPreferDark } from "./core/ThemeManager"
 import AboutWindow from "./surfaces/about/AboutWindow"
 import { setKitAppearance } from "../lib/nidara-kit"
+import { bindCursorThemeRefresh } from "./common/CursorRefresh"
 import { safeDisconnect } from "./core/signals"
 
 // ── The kit's appearance seam ────────────────────────────────────────────────
@@ -812,6 +813,14 @@ app.start({
     // "The Assistant is working in this window" — the inner glow follows
     // agentService.busy. Also clears a glow left on by a shell that died mid-turn.
     initAgentGlow()
+
+    // A cursor theme/size change does not reach the cursor already on screen: neither
+    // Hyprland nor GTK re-applies it, both wait for the next `wl_pointer.enter`, and
+    // that is why the setting only "arrives" when you leave the window you changed it
+    // from. Make our own surfaces re-issue it. The window list is read at call time —
+    // the Settings window is created lazily and monitors come and go.
+    // See common/CursorRefresh.ts for both upstream code paths.
+    bindCursorThemeRefresh(() => (app.get_windows() ?? []) as Gtk.Window[])
 
     // Note: the nidara-bar/dock blur layer rules live in hyprland.lua
     // (hl.layer_rule). They used to be re-applied here via `hyprctl keyword`,

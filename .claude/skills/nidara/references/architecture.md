@@ -889,6 +889,17 @@ Five pillars by responsibility (UI split renamed from the old `widget/` dir 2026
     protocol — see `state-and-ipc.md`); no ShellActions entry (no widget consumes it).
 - **`common/`** — shared UI pieces used across surfaces and widgets
   (`Slider`, `SquircleContainer`, `ScaleRevealer`, `MenuRow`, `widget-kit`, `DrawingUtils`…).
+  - `CursorRefresh.ts` — **a cursor theme/size change does not reach the cursor already on
+    screen.** Neither side re-applies it: Hyprland's `changeTheme()` reloads the theme and
+    schedules frames but never re-issues the shape, and GTK4's
+    `_gdk_wayland_display_set_cursor_theme()` only caches the size. Both refresh on the next
+    `wl_pointer.enter`, which is why the setting appears to arrive only when you leave the
+    window you changed it from. This bumps the cursor on every shell surface (bar, dock,
+    Settings…) so ours re-issue it at once; a third-party app is its own client and still
+    waits for its enter. Two things that are not obvious and cost a session each: the bump
+    must go through a **different shape** (GDK compares cursors by equality, so a fresh
+    `Gdk.Cursor` with the same name puts nothing on the wire), and **a screenshot cannot
+    verify any of this** — see the cursor section in `dev-workflow.md` before writing a test.
 - **`widgets/`** — atomic CC/bar widgets, **auto-registered**: one file that
     default-exports a `const w: AtomicWidget = {...}` is ALL it takes —
     `scripts/gen-widget-index.mjs` scans the dir and regenerates the committed
