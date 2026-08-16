@@ -3902,3 +3902,51 @@ would be a lie with better manners.
 watch `client`'s `device-added`/`device-removed` and re-resolve `wifi`/`wired`. Until then the
 page carries a comment at the `if (network.wired)` site so nobody "fixes" it by copying Audio.
 The workaround for a user is a shell reload (`Super+Shift+R`).
+
+### 72. Cursor SIZE re-renders live, cursor THEME does not — and a client cannot fix it (2026-08-16)
+
+Reported by the user as one bug ("cursor style and size only change when I leave the window") and it
+is two, with opposite answers. Both halves were confirmed **by eye**, on this machine, with the
+pointer parked inside a shell window and untouched:
+
+- **Size: not broken.** Change it and the cursor resizes immediately, with no shell involvement at
+  all — verified with the shell running plain `main`. Hyprland's `changeTheme()` → `updateTheme()`
+  recomputes `m_currentStyleInfo.size` and schedules `AQ_SCHEDULE_CURSOR_SHAPE` on every monitor, and
+  that redraw picks the new size up on its own.
+- **Theme: broken, and out of our reach.** Pick a cursor theme and the picture does not change until
+  the pointer leaves the surface and comes back.
+
+▶️ **Do not try to fix the theme half from the shell — it has been tried and measured.** A client
+CAN re-issue its cursor (GTK4 ≥ 4.16 drives it through `wp_cursor_shape_device_v1.set_shape`, and a
+bump through a different shape and straight back does put both requests on the wire — GDK compares
+cursors by equality, so a fresh `Gdk.Cursor` with the same NAME emits nothing). It changes nothing.
+Timestamps from the shell, on a theme picked in the Settings dropdown by hand:
+
+```
+20:30:03.898  hyprctl setcursor DONE Adwaita          ← the compositor already holds the new theme
+20:30:03.921  emit cursor-applied
+20:30:03.922  BUMPED [nidara-settings-window, dock, island, bar]
+```
+
+Correct order, the right surface under the pointer, no visible change. Re-issuing the shape does not
+make Hyprland rebuild the cursor from the new theme; only a pointer `enter` does. The fix belongs in
+`changeTheme()`, which reloads the theme and never re-applies the shape in force — the compositor is
+the only party that knows every pointer, so it is also the only one that can fix it for third-party
+apps, which have exactly the same symptom.
+
+⚠️ **Three ways this investigation produced false results**, all worth knowing before re-opening it:
+`grim -c` reports a STALE cursor and will "prove" any such fix dead (see the cursor section in
+`dev-workflow.md`); `nidara-click`'s pointer choreography lands its `enter` seconds after the command
+returns, so it applies the change by itself and makes a broken fix look like a working one; and
+restarting the shell destroys the Settings window, leaving the pointer over the wallpaper with no
+shell surface to act on. The only instruments that told the truth were a person looking at the screen
+and `WAYLAND_DEBUG=1`.
+
+⚠️ **It used to work.** The user remembers the theme applying instantly, which makes this a
+REGRESSION and is where a future attempt should start — not in the code above. Two unverified
+suspects, both cheap to check: the Hyprland upgrade (0.56.2 is from 2026-08-05), and **GTK4 moving to
+`cursor-shape-v1`** (4.16+). The second is the more interesting one: before it, a GTK client uploaded
+its own cursor BUFFER, and a client that re-reads `gtk-cursor-theme-name` re-uploads by itself — so
+the theme would have refreshed with no compositor involvement and no `enter`. If that is it, the
+behaviour did not break so much as move house, and the client-side lane above was the right idea a
+version too late. Bisecting one of the two is the whole investigation.
