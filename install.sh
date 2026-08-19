@@ -361,19 +361,15 @@ echo "  Building greeter..."
 cd "$REPO_DIR/ui/shell"
 npx sass --no-charset ../greeter/style.scss ../greeter/style.css && sed -i '/@charset/d' ../greeter/style.css
 cd "$REPO_DIR/ui/greeter"
-if [ "$MODE" != "dev" ]; then
-    mkdir -p build
-    "$REPO_DIR/scripts/bundle.sh" app.ts build/nidara-greeter
-    echo "  [OK] Greeter bundle: $REPO_DIR/ui/greeter/build/nidara-greeter"
-fi
+mkdir -p build
+"$REPO_DIR/scripts/bundle.sh" app.ts build/nidara-greeter
+echo "  [OK] Greeter bundle: $REPO_DIR/ui/greeter/build/nidara-greeter"
 
 echo "  Building lockscreen..."
 cd "$REPO_DIR/ui/lockscreen"
-if [ "$MODE" != "dev" ]; then
-    mkdir -p build
-    "$REPO_DIR/scripts/bundle.sh" app.ts build/nidara-lock
-    echo "  [OK] Lockscreen bundle: $REPO_DIR/ui/lockscreen/build/nidara-lock"
-fi
+mkdir -p build
+"$REPO_DIR/scripts/bundle.sh" app.ts build/nidara-lock
+echo "  [OK] Lockscreen bundle: $REPO_DIR/ui/lockscreen/build/nidara-lock"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,9 +498,7 @@ sudo cp -r "$REPO_DIR/ui/shell/assets" /usr/share/nidara/ui/shell/
 
 # Greeter bundle + style
 sudo mkdir -p /usr/share/nidara/ui/greeter/build
-if [ "$MODE" != "dev" ]; then
-    sudo cp "$REPO_DIR/ui/greeter/build/nidara-greeter" /usr/share/nidara/ui/greeter/build/
-fi
+sudo cp "$REPO_DIR/ui/greeter/build/nidara-greeter" /usr/share/nidara/ui/greeter/build/
 sudo cp "$REPO_DIR/ui/greeter/style.css" /usr/share/nidara/ui/greeter/
 
 # Greeter's blank GTK4 theme. The greeter starts with GTK_THEME=nidara so GTK4
@@ -517,9 +511,7 @@ sudo rm -rf /usr/share/themes/crystal-shell
 
 # Lockscreen bundle (shares greeter's style.css)
 sudo mkdir -p /usr/share/nidara/ui/lockscreen/build
-if [ "$MODE" != "dev" ]; then
-    sudo cp "$REPO_DIR/ui/lockscreen/build/nidara-lock" /usr/share/nidara/ui/lockscreen/build/
-fi
+sudo cp "$REPO_DIR/ui/lockscreen/build/nidara-lock" /usr/share/nidara/ui/lockscreen/build/
 
 # Session wrapper scripts
 sudo cp "$REPO_DIR/bin/nidara"     /usr/bin/nidara

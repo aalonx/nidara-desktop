@@ -5,7 +5,8 @@
 # Called by hypridle, loginctl lock-session, and Hyprland keybinds
 # ─────────────────────────────────────────────────────────────────────────────
 
-BUNDLE="/usr/share/nidara/ui/lockscreen/build/nidara-lock"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nidara"
+SYS_BUNDLE="/usr/share/nidara/ui/lockscreen/build/nidara-lock"
 # Per-user log path, like every other nidara-* log. NEVER a path the session
 # user can't write (/var/log, another user's /tmp file): the `>> $LOG` redirect
 # fails and bash then skips launching the bundle entirely, so the screen
@@ -23,8 +24,18 @@ if pgrep -x nidara-lock | grep -qv "^${SELF}$"; then
     exit 0
 fi
 
-if [ ! -x "$BUNDLE" ]; then
-    echo "[$(date '+%H:%M:%S')] nidara-lock: ERROR — bundle not found at $BUNDLE" | tee -a "$LOG"
+# ── Dev mode check ───────────────────────────────────────────────────────────
+DEV_FILE="$CONFIG_DIR/.dev"
+USE_DEV="no"
+if [ -f "$DEV_FILE" ]; then
+    SOURCE_DIR="$(cat "$DEV_FILE")"
+    if [ -f "$SOURCE_DIR/ui/lockscreen/app.ts" ]; then
+        USE_DEV="yes"
+    fi
+fi
+
+if [ "$USE_DEV" = "no" ] && [ ! -x "$SYS_BUNDLE" ]; then
+    echo "[$(date '+%H:%M:%S')] nidara-lock: ERROR — bundle not found at $SYS_BUNDLE" | tee -a "$LOG"
     exit 1
 fi
 
@@ -38,11 +49,17 @@ hyprctl dispatch 'hl.dsp.submap("lock")' >> "$LOG" 2>&1 || true
 # vanishes on wake — seen 2026-06-10), relaunch it. misc.allow_session_lock_restore
 # lets the new instance take over the lock instead of leaving Hyprland's red
 # "lock app crashed" screen.
-cd /usr/share/nidara/ui/lockscreen
 attempts=0
 while true; do
-    "$BUNDLE" >> "$LOG" 2>&1
-    code=$?
+    if [ "$USE_DEV" = "yes" ]; then
+        cd "$SOURCE_DIR/ui/lockscreen"
+        "$SOURCE_DIR/scripts/run.sh" app.ts >> "$LOG" 2>&1
+        code=$?
+    else
+        cd /usr/share/nidara/ui/lockscreen
+        "$SYS_BUNDLE" >> "$LOG" 2>&1
+        code=$?
+    fi
     [ "$code" -eq 0 ] && break
     attempts=$((attempts + 1))
     if [ "$attempts" -ge 5 ]; then
