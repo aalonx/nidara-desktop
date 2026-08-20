@@ -1495,3 +1495,31 @@ This is the right place for new shared, Adwaita-free primitives.
   These handlers have a **test harness** that needs neither Hyprland nor Steam — `scripts/dev/hypr-game-mode-test.lua`, a CI gate; see `dev-workflow.md`.
 - **`nidara-game-mode` script (`Super+Shift+G`)** + **`GamingManager.ts` + Settings → Gaming (`gaming.json`):** `wallpaperMode` (artwork/custom/none), transition, `performanceProfile`.
 - **`Super+B` → `toggleBarOverlay`** (alias `toggleGameOverlay`): promotes **only the Bar** to OVERLAY layer over any fullscreen window (requires an active fullscreen window to activate; deactivation always allowed). Not game-specific — it lives here because games are the main fullscreen use case.
+
+## Planned Enhancements & Roadmap
+
+Backlog of designed desktop enhancements to prioritize for upcoming iterations:
+
+### 1. UI & Lockscreen Enhancements
+1. **Lockscreen Media Player Controls (`ui/lockscreen/widget/Media.ts`)**:
+   - Compact glass capsule rendered on `nidara-lock` below the clock when an MPRIS player (Spotify, browser, etc.) is active.
+   - Album artwork, track title, artist name, and touch/click Play/Pause, Next, and Previous track controls.
+2. **Lockscreen Battery & Charging State Indicator (`ui/lockscreen/widget/Battery.ts`)**:
+   - Subtle battery percentage and AC charging status indicator integrated into the lockscreen bottom power bar or header.
+3. **Settings Visual Keyboard Shortcuts Explorer (`pages/Shortcuts.tsx`)**:
+   - Categorized and searchable visual explorer in Settings for all Hyprland and Nidara keybindings (Windows, Launchers, Media, Screenshots, AI/Agent).
+4. **Config Backup & Restore Manager (`nidara-backup` / Settings UI)**:
+   - One-click export/import bundle (`.tar.gz` or JSON) of user preferences (`~/.config/nidara/`: appearance, wallpapers, dock pins, widget layout, autostart).
+
+### 2. Structural & Core System Architecture
+1. **Native GTK4 Polkit Authentication Agent (`nidara-polkit` / `ui/polkit/`)**:
+   - Replace legacy GTK3 `polkit-gnome` daemon with a native Nidara GTK4 glass-styled elevation prompt.
+   - Seamless identity: displays the user's avatar (`~/.face`), real name, action description, and fluid shake/error feedback for password validation.
+2. **Hardware OSD & Dynamic Island Feedback (Volume, Brightness, Mic Mute, CapsLock)**:
+   - Animated visual feedback pill via Dynamic Island / OSD overlay whenever hardware keys (`XF86Audio*`, `XF86MonBrightness*`, CapsLock) are triggered, replacing silent shellouts.
+3. **Extensible D-Bus Search Providers in Prism (`org.gnome.Shell.SearchProvider2`)**:
+   - Enable Prism to query D-Bus search providers and extensible plugins for instant indexing of calendar events, calculator results, browser bookmarks, and notes.
+4. **Automatic Solar / Geolocation Night Light Scheduling**:
+   - Automatic sunrise/sunset calculation or scheduled transitions for `hyprsunset` blue light filtering in `NightLightManager.ts` and `pages/Display.tsx`.
+5. **System Mime & Protocol Associations Manager**:
+   - Deep two-way synchronization of protocol handlers (`mailto:`, `webcal:`, `tg:`, `magnet:`) and default mime associations in `DefaultApps.tsx`.
