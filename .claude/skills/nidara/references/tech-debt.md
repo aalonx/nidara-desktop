@@ -2878,6 +2878,94 @@ honest test is a live A/B on the damage harness with the fps discipline from #46
 `draw_func` is not a valid damage source — it throttles the client and makes the two arms carry
 different loads).
 
+### 87. ⚠️ OPEN — what the greeter audit of 2026-08-24 left after the glass reached it
+
+The glass half is done: `ui/lib/glass-paint.ts` now holds the rim ramp, the silhouette and the
+shadow recipe, and the greeter/lockscreen capsule paints them (see `design-system.md`). Four things
+that audit found are NOT fixed, and one of them is about the instrument rather than the product.
+
+**a. The username is white text with no glass under it.** On a pale wallpaper `Ángel` sits directly
+on the backdrop at marginal contrast. This is #82 (thin glass cannot carry white text over a bright
+wallpaper) landing on the login screen, and the shadow does not help it — a label has no silhouette
+to shadow. It needs the #82 decision, not a local patch.
+
+**b. The avatar's ring is `2px solid var(--nidara-glass-border)`** (`.greeter-avatar`), a translucent
+white: on a pale wallpaper it disappears entirely, so a user with no photo gets an invisible circle
+around an inverted glyph. Same family as (a) — a token that assumes a dark backdrop, on the one
+surface whose backdrop is the user's own wallpaper.
+
+⚠️ **(a) and (b) SURVIVED the VM pass without being tested, and that is a gap, not a pass.** The
+VM's default wallpaper is dark blue, so both read fine there — which is exactly the condition under
+which they are not defects. Testing them needs a PALE wallpaper on the greeter, which means writing
+one into the greeter's own config path, not the user's. Do not read "the VM looked fine" as
+evidence on these two.
+
+**c. ✅ FIXED 2026-08-24 — the focus ring was the accent's DEFAULT, on a screen that had read the
+user's choice and dropped it.** It was on this list as "loud blue, may be ours, may be a GTK
+default leaking, not determined". It was neither: `ui/greeter/app.ts`'s `loadAccentCss()` never
+called `setAccentRim()`, while `ui/lockscreen/app.ts`'s copy of the same function — same name, same
+input, same job — always had, with the comment explaining why (a Cairo painter cannot read a CSS
+custom property, so it needs the accent as a VALUE). So the greeter's painted rim was permanently
+`#0088FF` while every CSS-driven accent beside it followed the user. Proven in the VM: with
+`{"accent":"green"}` in the world-readable mirror, the ring is now green. 🔑 The generalisable
+part: **two functions with the same name, the same input and the same job, one line apart in
+behaviour** is the exact shape #60 keeps predicting for these two bundles — look for it by DIFFING
+the pair, not by reading either one.
+
+**d. ✅ FIXED 2026-08-24 — `scripts/dev/lock-probe.js` had two fidelity defects, and one of them
+faked the exact symptom a reporter is likely to describe.** Kept here rather than moved, because
+the LESSON binds and the fix is small:
+
+  - **Power-bar icons were OFF unless `ICONS=1`,** so the default render showed three bare labels —
+    indistinguishable from a greeter that had lost its icons, and read that way. The flag's comment
+    justified the default ("a missing-glyph placeholder measures differently, and the probe exists
+    for type questions"), which is sound for MEASURING and a trap for LOOKING; it was also already
+    redundant, since the `file_test` beside it means a missing glyph draws nothing at all. Now ON
+    by default, `ICONS=0` to strip them, and **any render that is not the honest full thing stamps
+    a warning band across its own top-left** — because the PNG outlives the stdout, and a probe
+    image gets cropped, attached and reasoned about hours later by someone who never saw the
+    terminal.
+  - **The primary button was hardcoded `"Desbloquear"` even under `SCOPE=greeter`** (the real
+    greeter says `t("login")`), so every width verdict it ever gave for that button was the
+    LOCKSCREEN's. Fixed at the root rather than by typing a second literal: the probe now PARSES
+    `ui/greeter/lib/i18n.ts` and takes every string from the shipped catalog, so it cannot
+    disagree with the product again — and `LOCALE=xx` renders any of the twelve. ⚠️ Three keys are
+    QUOTED (`"pt-BR"`, `"pt-PT"`, `"zh-CN"`, because a hyphen is not a bare identifier); an
+    unquoted-only pattern silently sees nine locales, which is what the first version did and what
+    sweeping all twelve caught.
+
+  🔑 **The rule this leaves.** Neither was a bug in the desktop — that is the point. An instrument
+  that reproduces the patient's symptom from its own defaults WILL be believed, so a probe's
+  default must be the honest render and every degraded mode must announce itself in the artefact
+  it produces, not only in the terminal. Same lesson as the `feedback` memory on captures hiding
+  artefacts, from the other side.
+
+  📈 And the fix paid immediately: sweeping the twelve locales, the power bar runs from **278px
+  (zh-CN) to 441px (nl)**, a 59 % spread. Single-locale renders could not have shown that, and it
+  is the kind of number the login screen's text budget actually turns on.
+
+**e. ✅ ANSWERED by the VM, 2026-08-24 — and the answer was mostly "it works".** The probe cannot
+see the avatar GLYPH (it stubs the avatar as a plain box), the multi-user switcher chips (also
+stubbed), the caps-lock warning, or the greeter running as the `greeter` system user. Swept on a
+clean install: **the avatar glyph renders** (white `user-round`, ring visible), the power-bar and
+locale-bar glyphs render, the greeter user reaches `/usr/share/nidara` fine, and the greetd journal
+is clean — no errors, no criticals. The multi-user switcher and caps-lock stay untested (one user,
+no keyboard state to force).
+
+⚠️ **But the VM found what the probe could not, and it was the user's original report.** All three
+dropdown chevrons drew nothing on the real greeter — see the fix in `design-system.md`. The probe
+had been rendering them because it borrowed the developer's platform theme instead of the blank one
+`app.ts` installs. That is the lesson of (d) with the sign flipped: an instrument that INVENTS a
+working control is worse than one that invents a broken one, because only the VM can catch it.
+
+**f. Nothing gates a shadow against a layer's `ignore_alpha`.** `blur-threshold-check.mjs` guards
+the floor (a threshold that kills the blur) and knows nothing about the ceiling (a shadow low
+enough to be blurred behind, = #237). The greeter was checked by hand — 0.18 vs 0.3, 30.6 levels of
+margin — and the lockscreen cannot be affected. A gate was considered and NOT written: shadows are
+opt-in per widget (`SquircleContainer`'s `shadow` prop, `DockAxis`, `GlassBubble`), not per layer,
+so mapping surface → shadow statically is not a ten-line script, and a gate that fails for a
+surface with no shadow would block the merge queue for nothing. Write it properly or not at all.
+
 ## Index of resolved items (bodies live in `tech-debt-resolved.md`)
 
 Kept here so that a cross-reference by number still resolves from this file, and so that a
