@@ -1487,6 +1487,64 @@ accessibility text scale can reach it through the dpi, and 11pt is 14.667px — 
 lands a fractional anchor on integers. It buys nothing either; crispness comes from
 `gtk-hint-font-metrics`. Full story under "the tops of letters were being shaved" below.
 
+### The installer is the FOURTH bundle wearing the system, and it found four holes (2026-08-26)
+
+`ui/installer/` is the first surface built mostly by an outside agent, which makes it the
+first honest test of whether the kit is *usable* from a bundle that is not the shell. It is —
+`NidaraList`, `NidaraRow`, `NidaraStackedRow`, `NidaraButton`, `NidaraClamp` and the
+appearance seam all came across untouched. What did not come across is the **system around**
+the components, and every one of the four holes has the same shape: a kit widget whose rule
+names something the borrowing bundle's sheet never defined.
+
+1. **`--nidara-surface-strong` did not exist in the installer's ramp.** It is the hover of
+   anything whose resting fill is `--nidara-surface-raised` — which is every round icon
+   button. The rule was there, the token was not, so the button's hover resolved to nothing
+   and the control looked inert. A missing custom property is not an error in GTK4; it is a
+   declaration that quietly does not apply.
+2. **No `.nd-icon` rule at all.** The shipped icons are Lucide SVGs: they render BLACK and
+   only become white through `-gtk-icon-filter: invert(1)` (see `ui/lib/icons.ts`). The shell
+   has the rule in `_reset.scss`, the greeter/lock sheet has its own; the installer had
+   neither, so its close glyph was black-on-dark-glass. **Any bundle that shows a shipped icon
+   owes this rule and its light-mode counterpart** — and a bundle WITH a light mode owes both,
+   which is why the greeter's unconditional invert could not simply be copied.
+3. **`window.<class> *` silently kills the glass.** `.nidara-window-glass` is one class,
+   (0,1,0). `window.nidara-installer-window *` is a type plus a class, (0,1,1). So a blanket
+   `background-color: transparent` written to reach the children out-ranks the glass and the
+   card stops painting: an installer whose prose floats on the wallpaper with the file manager
+   readable through it. Seen on screen. **Put `background-color`/`color` on the WINDOW node
+   only** — `color` inherits by itself, and the descendant form is needed exclusively for the
+   `--nidara-*` block, where it is load-bearing (custom properties do NOT inherit reliably; the
+   token engine's `* { }` and `generateChromeTokenScope` exist for that reason alone).
+4. **The live half of the ramp has to be computed, not written.** Accent and window opacity
+   are the user's, so `style.scss` can only hold fallbacks; `app.ts` emits the rest into a
+   `Gtk.CssProvider` at `PRIORITY_USER + 20` — above the base sheet, because in GTK4 provider
+   priority is settled before specificity is looked at — and reloads it from a `Gio.FileMonitor`
+   on whichever `appearance.json` actually answered. Keep the monitor in a variable that
+   outlives the call: an unreferenced one is collected and its signal stops arriving silently.
+
+**`.nidara-circle-btn` moved to the kit in the same change**, with its widget: the shell's
+`common/IconButton.ts` is now a wrapper that adds only what the kit cannot reach (the glass
+tooltip, the capture-phase click). A fourth bundle asking for a close button is exactly the
+moment a shell-local "single source of truth" stops being one — and copying it instead would
+have given one process two definitions of one class, since the shell compiles both sheets.
+
+⛔ **Its `&.is-danger:hover` red stays OFF — decided 2026-08-26, do not restore it.** Both
+variants hover the same neutral grey; the class is still emitted, so the intent is recorded and
+one rule would turn it on. Reason: a red wash on the control you use to LEAVE a window spends
+the red budget (see "the red BUDGET is smaller than that") on the most routine click in the
+DE. It was proposed in that same move and declined on the merits, which makes it a decision
+rather than an oversight — and `IconButton`'s doc comment, which promised red for two years,
+was corrected to match.
+
+⚠️ The rule's history is still worth carrying, because it is a warning about orphan sweeps: it
+was deleted on 2026-06-23 (`d87e5e0a`) for having "no consumer", because the sweep grepped the
+literal `is-danger` while the consumer builds the class by interpolation — `is-${variant}` —
+the exact dynamic-class trap that same commit lists for `.accent-*`. So for two months the
+shell documented a hover it did not have, and nobody could tell whether that was a decision or
+a bug. **Grep a class before deleting it, then grep the fragments a template could assemble it
+from** — and when the answer is "we don't want it", say so in the sheet instead of deleting the
+rule silently.
+
 **Its sibling `ui/lib/styles/_mixins.scss` (2026-08-10) holds the mixins the KIT needs** —
 `nidara-reset`, `glass`, `material-card`, `nidara-row-states`, `nidara-tile-states` — for the
 same reason and with the same `@forward` from `_base.scss`. `material-control`,

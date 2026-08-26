@@ -34,6 +34,12 @@ export { NidaraSplitView } from "./split-view"
 export type { NidaraButtonVariant, NidaraButtonOpts } from "./button"
 export { NidaraButton } from "./button"
 
+// NidaraCircleButton — the round glass icon button (close/remove/collapse). Moved
+// here from the shell's common/IconButton.ts on 2026-08-26, with its CSS; that file
+// is now a wrapper adding the shell-only tooltip and capture-click.
+export type { NidaraCircleVariant, NidaraCircleButtonOpts } from "./button"
+export { NidaraCircleButton } from "./button"
+
 // NidaraFontButton — pill font picker (replaces Gtk.FontButton)
 export type { NidaraFontButtonOpts } from "./fontbutton"
 export { NidaraFontButton } from "./fontbutton"

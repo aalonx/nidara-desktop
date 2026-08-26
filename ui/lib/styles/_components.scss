@@ -408,6 +408,48 @@ button.nidara-btn {
     }
 }
 
+/* --- Round glass icon button (NidaraCircleButton) --------------------------
+   The single source of truth for close/remove/collapse controls, in every
+   bundle. MOVED here from `ui/shell/styles/_components.scss` when the widget
+   moved to `nidara-kit/button.ts` — the mechanical test at the top of this file
+   (a rule lives here iff its widget is built in `ui/lib/`) flipped for it, and
+   the shell's copy went in the same change. Two copies of one class in one
+   process is how the shell's version and the installer's start to disagree.
+
+   Size is set inline per use; shape/icon/hover are identical everywhere.
+   Padding (not set_size_request) sizes the button to its glyph — crisp icon,
+   circle centred on it. NB: named -circle- to avoid the existing
+   .nidara-icon-btn in the shell's _settings.scss (the sidebar toggle), whose
+   `button.` specificity would win. */
+.nidara-circle-btn {
+    padding: 4px;
+    min-width: 0;
+    min-height: 0;
+    /* Same fill as the count badge (nc-badge-header): simple, unified, no special tokens. */
+    background: var(--nidara-surface-raised);
+    border: none;
+    border-radius: var(--nidara-radius-pill);
+    transition: background-color 0.15s #{$ease};
+
+    image { margin: 0; }
+
+    /* Neutral hover (e.g. the collapse chevron): brighter fill — no border (it left corner dots). */
+    &:hover { background: var(--nidara-surface-strong); }
+
+    /* ⛔ NO `&.is-danger:hover { background: var(--nidara-danger) }`. The variant
+       class is still emitted (`is-${variant}`) and still carries the INTENT, but
+       both variants hover the same neutral grey — owner's call, 2026-08-26.
+       A red wash on the control you use to leave a window spends the red this DE
+       reserves for recording and for failure, on the most routine click there is.
+       The rule did exist until 2026-06-23, when the orphan sweep in d87e5e0a
+       deleted it for having "no consumer" — it grepped the literal `is-danger`
+       while the consumer assembles the class by interpolation, the same
+       dynamic-class trap that commit lists for `.accent-*`. It was proposed back
+       on 2026-08-26 and declined on the merits, so this is a DECISION now, not an
+       oversight: do not restore it, and fix `IconButton`'s prose instead if it
+       still promises red. */
+}
+
 // ── Gtk.DropDown ─────────────────────────────────────────────────────────────
 // GTK4 native dropdown — auto-positions above/below available space, and its popover
 // is a real Wayland surface, so the compositor's popup blur frosts it. The in-window
